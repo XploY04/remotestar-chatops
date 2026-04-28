@@ -250,24 +250,36 @@ async def _chatops_list_assigned_tickets(args: dict) -> str:
         project_pairs.append(("CANDIDATE", settings.plane_project_candidate))
 
     matches: list[dict] = []
+    PER_PAGE = 100
     for ident, proj_id in project_pairs:
-        cursor = None
-        for _ in range(20):  # safety: cap pagination
+        for page in range(20):  # safety: at most 2000 issues per project
             params: dict = {
                 "project_id": proj_id,
-                "per_page": 100,
+                "per_page": PER_PAGE,
                 "fields": "id,name,sequence_id,assignees,state",
             }
-            if cursor:
-                params["cursor"] = cursor
+            if page > 0:
+                # Plane MCP cursor format: "{per_page}:{page_index}:0"
+                params["cursor"] = f"{PER_PAGE}:{page}:0"
             text = await mcp.call("plane__list_work_items", params)
             try:
                 data = json.loads(text)
             except (json.JSONDecodeError, TypeError):
+                logger.warning("list_work_items returned non-JSON for %s page %d", ident, page)
                 break
-            if not isinstance(data, dict):
+            # The Plane MCP unwraps the response to a bare list; older versions
+            # might return {"results": [...]}. Handle both.
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("results") or []
+            else:
+                items = []
+            if not items:
                 break
-            for item in data.get("results") or []:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
                 if target_uuid in (item.get("assignees") or []):
                     matches.append({
                         "key": f"{ident}-{item.get('sequence_id')}",
@@ -276,9 +288,8 @@ async def _chatops_list_assigned_tickets(args: dict) -> str:
                         "project": ident,
                         "state_id": item.get("state"),
                     })
-            if not data.get("next_page_results"):
-                break
-            cursor = data.get("next_cursor")
+            if len(items) < PER_PAGE:
+                break  # last page
     logger.info("chatops__list_assigned_tickets: %s -> %d match(es)", email, len(matches))
     return json.dumps({
         "assignee_email": email,
