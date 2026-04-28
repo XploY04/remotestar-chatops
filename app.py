@@ -17,6 +17,7 @@ from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from typing import Any
 
+import aiohttp
 from fastapi import FastAPI, Request
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -267,8 +268,15 @@ Tools are prefixed with `<server>__<tool>`. For Plane tools, use the `plane__*` 
 """
 
 
-async def agent_loop(history: list[dict], user_email: str, user_slack_id: str) -> str:
-    """history is a list of {role, content} dicts. Last item is the current user request."""
+async def agent_loop(
+    history: list[dict], user_email: str, user_slack_id: str
+) -> tuple[str, dict | None]:
+    """history is a list of {role, content} dicts. Last item is the current user request.
+
+    Returns (final_text, created_issue) where created_issue is
+    {project_id, issue_id} from the most recent successful plane__create_work_item
+    call, or None if no issue was created.
+    """
     now_iso = datetime.now(timezone.utc).isoformat()
     system = build_system_prompt() + f"\n\n## Current request\n- User email: {user_email}\n- User Slack ID: {user_slack_id}\n- Timestamp: {now_iso}\n"
 
@@ -279,9 +287,10 @@ async def agent_loop(history: list[dict], user_email: str, user_slack_id: str) -
 
     tools = mcp.openai_tools()
     if not tools:
-        return "I'm not connected to any backends right now. Try again in a moment."
+        return "I'm not connected to any backends right now. Try again in a moment.", None
 
     tool_call_log: list[dict] = []
+    created_issue: dict | None = None
     max_iterations = 8
 
     for _ in range(max_iterations):
@@ -296,7 +305,7 @@ async def agent_loop(history: list[dict], user_email: str, user_slack_id: str) -
         if not msg.tool_calls:
             final = msg.content or "Done."
             await audit_log(user_slack_id, user_email, tool_call_log, final)
-            return final
+            return final, created_issue
 
         # Append assistant's tool-calling message
         messages.append({
@@ -321,6 +330,16 @@ async def agent_loop(history: list[dict], user_email: str, user_slack_id: str) -
             logger.info("Tool call: %s args=%s", tc.function.name, args)
             result = await mcp.call(tc.function.name, args)
             tool_call_log.append({"name": tc.function.name, "args": args, "result_preview": result[:200]})
+
+            # Capture the new issue's id so we can attach files after the loop
+            if tc.function.name == "plane__create_work_item":
+                try:
+                    data = json.loads(result)
+                    if isinstance(data, dict) and data.get("id") and args.get("project_id"):
+                        created_issue = {"project_id": args["project_id"], "issue_id": data["id"]}
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -329,7 +348,112 @@ async def agent_loop(history: list[dict], user_email: str, user_slack_id: str) -
 
     fallback = "I tried but couldn't complete the request in a reasonable number of steps. Try rephrasing?"
     await audit_log(user_slack_id, user_email, tool_call_log, fallback)
-    return fallback
+    return fallback, created_issue
+
+
+# ---------------------------------------------------------------------------
+# Slack file -> Plane issue attachment bridge
+#
+# The Plane MCP server has no attachment tools (verified against all 109).
+# Plane self-hosted uses a 3-step S3-presigned flow:
+#   1. POST issue-attachments/ with {name,size,type} -> presigned upload_data + asset_id
+#   2. POST upload_data.url multipart with the fields + file bytes
+#   3. PATCH issue-attachments/{asset_id}/ with {is_uploaded: true}
+# ---------------------------------------------------------------------------
+
+
+async def _attach_one_file(
+    session: aiohttp.ClientSession,
+    slack_file: dict,
+    project_id: str,
+    issue_id: str,
+) -> bool:
+    name = slack_file.get("name") or "attachment"
+    mime = slack_file.get("mimetype") or "application/octet-stream"
+    download_url = slack_file.get("url_private_download") or slack_file.get("url_private")
+    if not download_url:
+        logger.warning("Slack file %r has no download URL; skipping", name)
+        return False
+
+    # 1) Download bytes from Slack
+    async with session.get(
+        download_url,
+        headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
+    ) as r:
+        if r.status != 200:
+            logger.warning("Slack download for %r returned %s", name, r.status)
+            return False
+        data = await r.read()
+    size = len(data)
+
+    plane_headers = {"X-API-Key": settings.plane_api_key, "Content-Type": "application/json"}
+    create_url = (
+        f"{PLANE_HOST}/api/v1/workspaces/{settings.plane_workspace_slug}"
+        f"/projects/{project_id}/issues/{issue_id}/issue-attachments/"
+    )
+
+    # 2) Ask Plane for a presigned upload
+    async with session.post(
+        create_url,
+        json={"name": name, "size": size, "type": mime},
+        headers=plane_headers,
+    ) as r:
+        if r.status not in (200, 201):
+            body = await r.text()
+            logger.warning("Plane create-attachment %r failed: %s %s", name, r.status, body[:300])
+            return False
+        meta = await r.json()
+
+    upload = meta.get("upload_data") or {}
+    asset_id = meta.get("asset_id")
+    if not upload.get("url") or not asset_id:
+        logger.warning("Plane response missing upload_data/asset_id for %r: %s", name, meta)
+        return False
+
+    # 3) POST file to the storage URL with all the presigned fields
+    form = aiohttp.FormData()
+    for k, v in upload["fields"].items():
+        form.add_field(k, v)
+    form.add_field("file", data, filename=name, content_type=mime)
+    async with session.post(upload["url"], data=form) as r:
+        if r.status not in (200, 201, 204):
+            body = await r.text()
+            logger.warning("Storage upload for %r failed: %s %s", name, r.status, body[:300])
+            return False
+
+    # 4) Mark the attachment as uploaded
+    async with session.patch(
+        f"{create_url}{asset_id}/",
+        json={"is_uploaded": True},
+        headers=plane_headers,
+    ) as r:
+        if r.status not in (200, 204):
+            body = await r.text()
+            logger.warning("Mark-uploaded for %r failed: %s %s", name, r.status, body[:300])
+            return False
+
+    logger.info("Attached %r (%d bytes) to issue %s", name, size, issue_id)
+    return True
+
+
+async def attach_slack_files_to_plane_issue(
+    slack_files: list[dict], project_id: str, issue_id: str
+) -> tuple[int, int]:
+    """Upload all Slack files to a Plane issue. Returns (success_count, total)."""
+    if not slack_files:
+        return 0, 0
+    async with aiohttp.ClientSession() as session:
+        results = await asyncio.gather(
+            *[_attach_one_file(session, f, project_id, issue_id) for f in slack_files],
+            return_exceptions=True,
+        )
+    ok = 0
+    for r in results:
+        if isinstance(r, Exception):
+            logger.warning("Attachment task raised: %s", r)
+        elif r is True:
+            ok += 1
+    return ok, len(slack_files)
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +560,7 @@ async def slash_lazy(command, respond, client):
     text = await resolve_slack_mentions(client, text)
     email = await resolve_user_email(client, command["user_id"])
     try:
-        result = await agent_loop([{"role": "user", "content": text}], email, command["user_id"])
+        result, _created = await agent_loop([{"role": "user", "content": text}], email, command["user_id"])
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
@@ -464,7 +588,9 @@ async def mention_lazy(event, client):
         return
 
     text = strip_bot_mention(event.get("text", "") or "")
-    if not text:
+    files = event.get("files") or []
+
+    if not text and not files:
         await client.chat_postMessage(
             channel=event["channel"],
             thread_ts=reply_ts,
@@ -473,6 +599,15 @@ async def mention_lazy(event, client):
         return
 
     text = await resolve_slack_mentions(client, text)
+
+    # Hint the LLM that attachments are present so it knows to create an issue.
+    # The LLM doesn't upload them; we do that after the loop returns.
+    if files:
+        names = ", ".join(f.get("name") or "file" for f in files)
+        text = (text or "Create a ticket for this.") + (
+            f"\n\n[The user attached {len(files)} file(s) in Slack: {names}. "
+            "These will be auto-attached to the new Plane issue after you create it.]"
+        )
 
     # If this is in an existing thread, fetch history for context
     if event.get("thread_ts"):
@@ -486,11 +621,29 @@ async def mention_lazy(event, client):
         history = [{"role": "user", "content": text}]
 
     email = await resolve_user_email(client, event["user"])
+    created_issue: dict | None = None
     try:
-        result = await agent_loop(history, email, event["user"])
+        result, created_issue = await agent_loop(history, email, event["user"])
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
+
+    if files:
+        if created_issue:
+            ok, total = await attach_slack_files_to_plane_issue(
+                files, created_issue["project_id"], created_issue["issue_id"]
+            )
+            if total:
+                if ok == total:
+                    result += f"\n\nAttached {ok} file{'s' if ok != 1 else ''}."
+                else:
+                    result += f"\n\nAttached {ok}/{total} files (some failed; check logs)."
+        else:
+            result += (
+                f"\n\n_(I saw {len(files)} attachment(s) but didn't create a new issue, "
+                "so I didn't upload them. Mention me again with 'create a ticket' to attach.)_"
+            )
+
     await client.chat_postMessage(
         channel=event["channel"],
         thread_ts=reply_ts,
