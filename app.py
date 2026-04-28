@@ -463,9 +463,20 @@ Never pass literal strings like `<OLD_TICKET_ID>`, `<TYPE_ID>`, `<PROJECT_ID>`, 
 ## Tool naming
 Tools are prefixed with `<server>__<tool>`. For Plane tools, use the `plane__*` names.
 
+## Slack message formatting (mrkdwn, NOT standard markdown)
+Slack uses its own variant of markdown. Output your replies in that syntax — never standard CommonMark/GitHub markdown.
+- Bold: `*bold*` (single asterisks). NEVER `**bold**` — Slack shows the asterisks literally.
+- Italic: `_italic_`.
+- Inline code: `` `code` ``. Code block: triple backticks, no language tag.
+- Links: `<https://example.com|label>`. NEVER `[label](https://example.com)` — Slack shows the brackets literally.
+- Bullets: start the line with `•` or `-`. Headings (`#`, `##`) are NOT supported — use bold instead.
+- Strikethrough: `~text~`.
+
+When listing tickets, render each as one line:
+`• *RECRUITER-109* — <https://plane.remotestar.io/.../issues/.../|the issue title> _(Todo)_`
+
 ## User assistance
-- Be concise. Slack-friendly markdown (no headings).
-- After creating an issue, give the URL using the format above.
+- Be concise. After creating an issue, give the URL using the format above.
 - If a tool fails, explain the error in plain English and suggest a fix.
 """
 
@@ -758,6 +769,23 @@ slack_app = AsyncApp(
 )
 
 
+_MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+_MD_BOLD_RE = re.compile(r"\*\*([^\n*][^\n]*?)\*\*")
+_MD_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.*?)[ \t]*$", re.MULTILINE)
+
+
+def to_slack_mrkdwn(text: str) -> str:
+    """Best-effort conversion of common standard-markdown patterns the LLM
+    sometimes emits into Slack's mrkdwn dialect. Safety net only — the system
+    prompt also tells the LLM to write mrkdwn directly."""
+    if not text:
+        return text
+    text = _MD_LINK_RE.sub(r"<\2|\1>", text)
+    text = _MD_BOLD_RE.sub(r"*\1*", text)
+    text = _MD_HEADING_RE.sub(r"*\1*", text)
+    return text
+
+
 def is_allowed_channel(channel_id: str) -> bool:
     if not settings.allowed_channels:
         return True  # if not configured, allow everywhere
@@ -874,7 +902,7 @@ async def slash_lazy(command, respond, client):
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
-    await respond(text=result, response_type="in_channel")
+    await respond(text=to_slack_mrkdwn(result), response_type="in_channel")
 
 
 slack_app.command("/cs")(ack=slash_ack, lazy=[slash_lazy])
@@ -979,7 +1007,7 @@ async def mention_lazy(event, client):
     await client.chat_postMessage(
         channel=event["channel"],
         thread_ts=reply_ts,
-        text=result,
+        text=to_slack_mrkdwn(result),
     )
 
 
