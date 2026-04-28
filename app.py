@@ -334,7 +334,9 @@ async def agent_loop(
             result = await mcp.call(tc.function.name, args)
             tool_call_log.append({"name": tc.function.name, "args": args, "result_preview": result[:200]})
 
-            # Capture the new issue's id so we can attach files after the loop
+            # Capture the issue id so we can attach files after the loop.
+            # We track both create_work_item (new issue) and update_work_item
+            # (so users can attach files to an existing ticket via the bot).
             if tc.function.name == "plane__create_work_item":
                 try:
                     data = json.loads(result)
@@ -342,6 +344,11 @@ async def agent_loop(
                         created_issue = {"project_id": args["project_id"], "issue_id": data["id"]}
                 except (json.JSONDecodeError, TypeError):
                     pass
+            elif tc.function.name == "plane__update_work_item":
+                proj = args.get("project_id")
+                wid = args.get("work_item_id") or args.get("issue_id")
+                if proj and wid:
+                    created_issue = {"project_id": proj, "issue_id": wid}
 
             messages.append({
                 "role": "tool",
@@ -370,22 +377,22 @@ async def _attach_one_file(
     slack_file: dict,
     project_id: str,
     issue_id: str,
-) -> bool:
+) -> dict | None:
+    """Upload one Slack file to Plane. Returns {asset_url, name, mime} on success, else None."""
     name = slack_file.get("name") or "attachment"
     mime = slack_file.get("mimetype") or "application/octet-stream"
     download_url = slack_file.get("url_private_download") or slack_file.get("url_private")
     if not download_url:
         logger.warning("Slack file %r has no download URL; skipping", name)
-        return False
+        return None
 
-    # 1) Download bytes from Slack
     async with session.get(
         download_url,
         headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
     ) as r:
         if r.status != 200:
             logger.warning("Slack download for %r returned %s", name, r.status)
-            return False
+            return None
         data = await r.read()
     size = len(data)
 
@@ -395,7 +402,6 @@ async def _attach_one_file(
         f"/projects/{project_id}/issues/{issue_id}/issue-attachments/"
     )
 
-    # 2) Ask Plane for a presigned upload
     async with session.post(
         create_url,
         json={"name": name, "size": size, "type": mime},
@@ -404,16 +410,16 @@ async def _attach_one_file(
         if r.status not in (200, 201):
             body = await r.text()
             logger.warning("Plane create-attachment %r failed: %s %s", name, r.status, body[:300])
-            return False
+            return None
         meta = await r.json()
 
     upload = meta.get("upload_data") or {}
     asset_id = meta.get("asset_id")
+    asset_url = meta.get("asset_url")
     if not upload.get("url") or not asset_id:
         logger.warning("Plane response missing upload_data/asset_id for %r: %s", name, meta)
-        return False
+        return None
 
-    # 3) POST file to the storage URL with all the presigned fields
     form = aiohttp.FormData()
     for k, v in upload["fields"].items():
         form.add_field(k, v)
@@ -422,9 +428,8 @@ async def _attach_one_file(
         if r.status not in (200, 201, 204):
             body = await r.text()
             logger.warning("Storage upload for %r failed: %s %s", name, r.status, body[:300])
-            return False
+            return None
 
-    # 4) Mark the attachment as uploaded
     async with session.patch(
         f"{create_url}{asset_id}/",
         json={"is_uploaded": True},
@@ -433,30 +438,90 @@ async def _attach_one_file(
         if r.status not in (200, 204):
             body = await r.text()
             logger.warning("Mark-uploaded for %r failed: %s %s", name, r.status, body[:300])
-            return False
+            return None
 
     logger.info("Attached %r (%d bytes) to issue %s", name, size, issue_id)
-    return True
+    return {"asset_url": asset_url, "name": name, "mime": mime}
 
 
 async def attach_slack_files_to_plane_issue(
     slack_files: list[dict], project_id: str, issue_id: str
-) -> tuple[int, int]:
-    """Upload all Slack files to a Plane issue. Returns (success_count, total)."""
+) -> tuple[list[dict], int]:
+    """Upload all Slack files. Returns (list of successful uploads, total attempted).
+
+    After uploading, the successful image attachments are also embedded inline in
+    the issue's description_html so they render in the issue body, not just as a
+    separate Attachments section."""
     if not slack_files:
-        return 0, 0
+        return [], 0
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(
             *[_attach_one_file(session, f, project_id, issue_id) for f in slack_files],
             return_exceptions=True,
         )
-    ok = 0
+    successful: list[dict] = []
     for r in results:
         if isinstance(r, Exception):
             logger.warning("Attachment task raised: %s", r)
-        elif r is True:
-            ok += 1
-    return ok, len(slack_files)
+        elif isinstance(r, dict):
+            successful.append(r)
+
+    if successful:
+        await _embed_attachments_in_description(project_id, issue_id, successful)
+
+    return successful, len(slack_files)
+
+
+async def _embed_attachments_in_description(
+    project_id: str, issue_id: str, attachments: list[dict]
+) -> None:
+    """Append <img> / file links into the issue's description_html so attachments
+    render inline. Images become <img>; everything else becomes a text link."""
+    plane_headers = {"X-API-Key": settings.plane_api_key, "Content-Type": "application/json"}
+    issue_url = (
+        f"{PLANE_HOST}/api/v1/workspaces/{settings.plane_workspace_slug}"
+        f"/projects/{project_id}/issues/{issue_id}/"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(issue_url, headers=plane_headers) as r:
+                if r.status != 200:
+                    logger.warning("Could not fetch issue for description embed: %s", r.status)
+                    return
+                issue = await r.json()
+            current = issue.get("description_html") or ""
+
+            blocks = []
+            for a in attachments:
+                full_url = f"{PLANE_HOST}{a['asset_url']}"
+                if (a.get("mime") or "").startswith("image/"):
+                    blocks.append(
+                        f'<p><img src="{full_url}" alt="{a["name"]}" /></p>'
+                    )
+                else:
+                    blocks.append(
+                        f'<p><a href="{full_url}">{a["name"]}</a></p>'
+                    )
+            embed_html = "".join(blocks)
+
+            # Insert before the attribution footer (<hr/>) if present, else append.
+            if "<hr/>" in current:
+                new_desc = current.replace("<hr/>", embed_html + "<hr/>", 1)
+            else:
+                new_desc = current + embed_html
+
+            async with session.patch(
+                issue_url,
+                headers=plane_headers,
+                json={"description_html": new_desc},
+            ) as r:
+                if r.status not in (200, 204):
+                    body = await r.text()
+                    logger.warning("Description embed PATCH failed: %s %s", r.status, body[:300])
+                    return
+            logger.info("Embedded %d attachment(s) inline in issue %s", len(attachments), issue_id)
+    except Exception as e:
+        logger.warning("Description embed crashed: %s", e, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -670,18 +735,19 @@ async def mention_lazy(event, client):
 
     if files:
         if created_issue:
-            ok, total = await attach_slack_files_to_plane_issue(
+            uploaded, total = await attach_slack_files_to_plane_issue(
                 files, created_issue["project_id"], created_issue["issue_id"]
             )
+            ok = len(uploaded)
             if total:
                 if ok == total:
-                    result += f"\n\nAttached {ok} file{'s' if ok != 1 else ''}."
+                    result += f"\n\nAttached {ok} file{'s' if ok != 1 else ''} inline in the issue."
                 else:
                     result += f"\n\nAttached {ok}/{total} files (some failed; check logs)."
         else:
             result += (
-                f"\n\n_(I saw {len(files)} attachment(s) but didn't create a new issue, "
-                "so I didn't upload them. Mention me again with 'create a ticket' to attach.)_"
+                f"\n\n_(I saw {len(files)} attachment(s) but didn't operate on a Plane issue, "
+                "so I didn't upload them. Mention me again asking to create or update a specific ticket.)_"
             )
 
     await client.chat_postMessage(
