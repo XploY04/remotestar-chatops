@@ -243,6 +243,17 @@ def build_system_prompt() -> str:
 - If you can't find a matching member, tell the user clearly: "I couldn't find a Plane user with email X — please check they're in the workspace."
 - If the user only gave a name (not email), look up by display_name in the members map; if multiple match, ask which one.
 
+## Listing and searching work items
+- `plane__list_work_items` requires EITHER `project_id` OR `workspace_search: true`. Calling it without one returns HTTP 403.
+- For "list my tickets" / "show all open recruiter tickets" across both projects, pass `workspace_search: true` plus your filters (e.g. `assignee_ids`, `state_groups`).
+- For "list tickets in CANDIDATE" / "in RECRUITER", pass the matching `project_id`.
+- For free-text search ("find tickets about login"), use `plane__search_work_items` with a `query`. That is workspace-wide by default.
+- For "show me RECRUITER-106" / "PROJ-NN" lookups, use `plane__retrieve_work_item_by_identifier` with `project_identifier` (RECRUITER or CANDIDATE) and `issue_identifier` (the integer sequence number).
+
+Project identifiers for `retrieve_work_item_by_identifier`:
+- `RECRUITER` → recruiter project (UUID: `{settings.plane_project_recruiter}`)
+- `CANDIDATE` → candidate project (UUID: `{settings.plane_project_candidate}`)
+
 ## Issue URL format (CRITICAL)
 Self-hosted Plane URL format — use this exactly, never `plane.com`:
 
