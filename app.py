@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from typing import Any
@@ -259,7 +260,13 @@ For `description_html`, format as HTML with the user's content followed by an at
 ```
 
 ## Slack file attachments (IMPORTANT)
-If the user message mentions that files were attached in Slack (you'll see `[The user attached N file(s) in Slack: ...]`), do NOT apologize or say you can't attach them. The host application uploads those files to the Plane issue automatically AFTER you finish creating the work item — you don't need to (and can't) call any attachment tool yourself. Just create the work item normally; the system handles the rest.
+- If the user message mentions that files were attached in Slack (you'll see `[The user attached N file(s) in Slack: ...]`), the host application will upload those files AND embed them inline in the issue's description automatically AFTER your tool calls finish.
+- Do NOT include any `<img>` tags in `description_html`. Do NOT make up image URLs like `https://plane.remotestar.io/path/to/image.png` — the system inserts the real `<img>` tags itself.
+- Do NOT apologize or say "I can't attach files." Just operate on the right work item; uploads happen after.
+- Attachments are bound to the LAST work item you created or updated. So if the user says "attach this image to PROJ-123", call `plane__update_work_item` (or `plane__retrieve_work_item_by_identifier` first to get its UUID) and stop — do not delete and recreate.
+
+## Never use placeholder strings
+Never pass literal strings like `<OLD_TICKET_ID>`, `<TYPE_ID>`, `<PROJECT_ID>`, etc. as tool arguments. They are not valid IDs and will produce 404s. If you don't have a real UUID, call the appropriate `list_*`, `search_work_items`, or `retrieve_work_item_by_identifier` tool first to obtain one.
 
 ## Tool naming
 Tools are prefixed with `<server>__<tool>`. For Plane tools, use the `plane__*` names.
@@ -349,6 +356,13 @@ async def agent_loop(
                 wid = args.get("work_item_id") or args.get("issue_id")
                 if proj and wid:
                     created_issue = {"project_id": proj, "issue_id": wid}
+            elif tc.function.name == "plane__delete_work_item":
+                # If the LLM just deleted the issue we were tracking, drop it so
+                # we don't try to upload attachments to a now-deleted ticket.
+                wid = args.get("work_item_id") or args.get("issue_id")
+                if created_issue and created_issue.get("issue_id") == wid:
+                    logger.info("Cleared tracked issue %s because LLM deleted it", wid)
+                    created_issue = None
 
             messages.append({
                 "role": "tool",
@@ -370,6 +384,16 @@ async def agent_loop(
 #   2. POST upload_data.url multipart with the fields + file bytes
 #   3. PATCH issue-attachments/{asset_id}/ with {is_uploaded: true}
 # ---------------------------------------------------------------------------
+
+
+def _looks_like_uuid(s: Any) -> bool:
+    if not isinstance(s, str):
+        return False
+    try:
+        uuid.UUID(s)
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 async def _attach_one_file(
@@ -734,7 +758,7 @@ async def mention_lazy(event, client):
         result = f"Something went wrong: {e}"
 
     if files:
-        if created_issue:
+        if created_issue and _looks_like_uuid(created_issue.get("issue_id")) and _looks_like_uuid(created_issue.get("project_id")):
             uploaded, total = await attach_slack_files_to_plane_issue(
                 files, created_issue["project_id"], created_issue["issue_id"]
             )
@@ -744,6 +768,9 @@ async def mention_lazy(event, client):
                     result += f"\n\nAttached {ok} file{'s' if ok != 1 else ''} inline in the issue."
                 else:
                     result += f"\n\nAttached {ok}/{total} files (some failed; check logs)."
+        elif created_issue:
+            logger.warning("Skipping upload: invalid issue ids %s", created_issue)
+            result += "\n\n_(Couldn't attach files: the ticket ID I picked up wasn't a valid UUID.)_"
         else:
             result += (
                 f"\n\n_(I saw {len(files)} attachment(s) but didn't operate on a Plane issue, "
