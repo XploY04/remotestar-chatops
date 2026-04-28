@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from typing import Any
@@ -180,7 +181,46 @@ openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
 
 PLANE_HOST = settings.plane_base_url.rstrip("/")
 
-SYSTEM_PROMPT = f"""You are RemoteStar's ChatOps assistant in Slack. You help the team manage Plane tickets through natural language.
+# Cached list of Plane workspace members: [{id, email, display_name}, ...]
+plane_members_cache: list[dict] = []
+
+
+async def refresh_plane_members() -> None:
+    """Fetch workspace members from Plane and cache."""
+    global plane_members_cache
+    try:
+        result_text = await mcp.call("plane__get_workspace_members", {})
+        # The tool returns JSON-ish text. Parse what we can.
+        try:
+            data = json.loads(result_text)
+        except json.JSONDecodeError:
+            # Sometimes content is a list of TextContent already concatenated; try to extract
+            data = []
+        members = []
+        items = data if isinstance(data, list) else data.get("members", []) if isinstance(data, dict) else []
+        for m in items:
+            if not isinstance(m, dict):
+                continue
+            members.append({
+                "id": m.get("id") or m.get("user_id") or m.get("member_id"),
+                "email": m.get("email"),
+                "display_name": m.get("display_name") or m.get("first_name") or m.get("email"),
+            })
+        plane_members_cache = [m for m in members if m.get("id") and m.get("email")]
+        logger.info("Cached %d Plane workspace members", len(plane_members_cache))
+    except Exception as e:
+        logger.warning("Failed to fetch Plane members: %s", e)
+
+
+def build_system_prompt() -> str:
+    members_block = ""
+    if plane_members_cache:
+        rows = "\n".join(f"- `{m['email']}` → `{m['id']}` ({m.get('display_name', '')})" for m in plane_members_cache)
+        members_block = f"\n## Plane workspace members (email → user_id)\nUse this map to resolve assignees. The `assignees` field on `plane__create_work_item` expects a list of Plane user_id values (UUIDs), NOT emails or Slack IDs.\n\n{rows}\n"
+    else:
+        members_block = "\n## Plane workspace members\nIf you need to assign someone, call `plane__get_workspace_members` first to get their Plane user_id (UUID).\n"
+
+    return f"""You are RemoteStar's ChatOps assistant in Slack. You help the team manage Plane tickets through natural language.
 
 ## Workspace context
 - Plane workspace slug: `{settings.plane_workspace_slug}`
@@ -190,27 +230,29 @@ SYSTEM_PROMPT = f"""You are RemoteStar's ChatOps assistant in Slack. You help th
   - **RECRUITER** (id: `{settings.plane_project_recruiter}`) — recruiter dashboard, hiring flows, ATS integration, talent, scrapers
 
 ## How to pick the project (be decisive, don't over-ask)
-Match by keyword in the user's message:
 - candidate, candidates, profile, signup, interview, jobs, matching, resume → CANDIDATE
 - recruiter, recruiters, hiring, ATS, scraper, talent, dashboard → RECRUITER
-- If the user explicitly says "in CANDIDATE" / "in RECRUITER" / "for the candidate app" → use that, no confirmation needed
-- If genuinely ambiguous (no keywords either way), THEN ask "Which project: CANDIDATE or RECRUITER?"
-- Default to CANDIDATE only if you're 50/50 and the user didn't say either word
-
-DO NOT ask for confirmation when the user has already specified a project. Just create.
+- If the user explicitly says a project, use it without confirming
+- If genuinely ambiguous, ask "CANDIDATE or RECRUITER?"
+{members_block}
+## Assigning tickets
+- The user's message may contain emails (e.g., `rudy@remotestar.io`) — these come from Slack `@mentions` already resolved to emails.
+- For `plane__create_work_item` and update tools, the `assignees` field expects a list of Plane user_id UUIDs. Look up the email in the workspace members map above to find the UUID.
+- If you can't find a matching member, tell the user clearly: "I couldn't find a Plane user with email X — please check they're in the workspace."
+- If the user only gave a name (not email), look up by display_name in the members map; if multiple match, ask which one.
 
 ## Issue URL format (CRITICAL)
-After creating an issue via `plane__create_work_item`, the tool result includes an `id` and `project` (or similar). Return a link in EXACTLY this format:
+Self-hosted Plane URL format — use this exactly, never `plane.com`:
 
 `{PLANE_HOST}/{settings.plane_workspace_slug}/projects/<PROJECT_ID>/issues/<ISSUE_ID>/`
 
-NEVER use `plane.com` or any other host — the user's Plane is self-hosted at `{PLANE_HOST}`.
+After `plane__create_work_item` succeeds, extract the new issue's id from the tool result and construct this URL.
 
-## Attribution
-When creating issues, include this in the `description_html` (or description) field:
+## Issue description
+For `description_html`, format as HTML with the user's content followed by an attribution footer:
 
-```
-<p>{{user_request}}</p>
+```html
+<p>{{user_message}}</p>
 <hr/>
 <p><em>Created via ChatOps by {{user_email}} at {{timestamp_iso}}</em></p>
 ```
@@ -221,14 +263,14 @@ Tools are prefixed with `<server>__<tool>`. For Plane tools, use the `plane__*` 
 ## User assistance
 - Be concise. Slack-friendly markdown (no headings).
 - After creating an issue, give the URL using the format above.
-- If a tool fails, explain the error in plain English.
+- If a tool fails, explain the error in plain English and suggest a fix.
 """
 
 
 async def agent_loop(history: list[dict], user_email: str, user_slack_id: str) -> str:
     """history is a list of {role, content} dicts. Last item is the current user request."""
     now_iso = datetime.now(timezone.utc).isoformat()
-    system = SYSTEM_PROMPT + f"\n\n## Current request\n- User email: {user_email}\n- User Slack ID: {user_slack_id}\n- Timestamp: {now_iso}\n"
+    system = build_system_prompt() + f"\n\n## Current request\n- User email: {user_email}\n- User Slack ID: {user_slack_id}\n- Timestamp: {now_iso}\n"
 
     messages: list[dict] = [
         {"role": "system", "content": system},
@@ -316,17 +358,27 @@ async def resolve_user_email(client, user_id: str) -> str:
         return "unknown@remotestar.io"
 
 
+async def resolve_slack_mentions(client, text: str) -> str:
+    """Convert `<@U...>` Slack user mentions into emails so the LLM can map to Plane users."""
+    if not text or "<@" not in text:
+        return text
+    user_ids = set(re.findall(r"<@([UW][A-Z0-9]+)>", text))
+    if not user_ids:
+        return text
+    for uid in user_ids:
+        email = await resolve_user_email(client, uid)
+        text = text.replace(f"<@{uid}>", email)
+    return text
+
+
 def strip_bot_mention(text: str) -> str:
-    """Remove leading <@U123> mention from app_mention text."""
+    """Remove the leading <@BOT> mention from app_mention text. Only strips the first one;
+    subsequent <@USER> mentions are preserved so they can be resolved to emails."""
     if not text:
         return ""
-    # Strip all leading <@...> mentions (sometimes there are multiple)
-    while True:
-        text = text.strip()
-        if text.startswith("<@") and ">" in text:
-            text = text.split(">", 1)[1]
-        else:
-            break
+    text = text.strip()
+    if text.startswith("<@") and ">" in text:
+        text = text.split(">", 1)[1]
     return text.strip()
 
 
@@ -381,6 +433,7 @@ async def slash_lazy(command, respond, client):
     if not text:
         await respond(text="Try: `/cs create a ticket: API returning 500s`", response_type="ephemeral")
         return
+    text = await resolve_slack_mentions(client, text)
     email = await resolve_user_email(client, command["user_id"])
     try:
         result = await agent_loop([{"role": "user", "content": text}], email, command["user_id"])
@@ -419,13 +472,16 @@ async def mention_lazy(event, client):
         )
         return
 
+    text = await resolve_slack_mentions(client, text)
+
     # If this is in an existing thread, fetch history for context
     if event.get("thread_ts"):
         history = await fetch_thread_history(client, event["channel"], event["thread_ts"])
-        # The latest message is already in the history (this mention's text).
-        # Make sure history isn't empty.
-        if not history:
-            history = [{"role": "user", "content": text}]
+        # Replace the last user message with the mention-resolved version
+        if history and history[-1]["role"] == "user":
+            history[-1]["content"] = text
+        else:
+            history.append({"role": "user", "content": text})
     else:
         history = [{"role": "user", "content": text}]
 
@@ -475,6 +531,7 @@ async def on_startup() -> None:
             logger.warning("MongoDB ping failed; audit log disabled: %s", e)
             mongo_client = None
     await mcp.start()
+    await refresh_plane_members()
 
 
 @api.on_event("shutdown")
