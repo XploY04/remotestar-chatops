@@ -1,0 +1,17 @@
+[Unit]
+Description=RemoteStar ChatOps Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/remotestar-chatops
+ExecStart=/root/remotestar-chatops/venv/bin/python -m app
+Restart=always
+RestartSec=5
+EnvironmentFile=/root/remotestar-chatops/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
