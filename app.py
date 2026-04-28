@@ -214,13 +214,14 @@ Tools are prefixed with `<server>__<tool>`. For Plane tools, use the `plane__*` 
 """
 
 
-async def agent_loop(user_text: str, user_email: str, user_slack_id: str) -> str:
+async def agent_loop(history: list[dict], user_email: str, user_slack_id: str) -> str:
+    """history is a list of {role, content} dicts. Last item is the current user request."""
     now_iso = datetime.now(timezone.utc).isoformat()
     system = SYSTEM_PROMPT + f"\n\n## Current request\n- User email: {user_email}\n- User Slack ID: {user_slack_id}\n- Timestamp: {now_iso}\n"
 
     messages: list[dict] = [
         {"role": "system", "content": system},
-        {"role": "user", "content": user_text},
+        *history,
     ]
 
     tools = mcp.openai_tools()
@@ -306,10 +307,51 @@ async def resolve_user_email(client, user_id: str) -> str:
 
 def strip_bot_mention(text: str) -> str:
     """Remove leading <@U123> mention from app_mention text."""
-    parts = text.split(" ", 1)
-    if parts and parts[0].startswith("<@") and parts[0].endswith(">"):
-        return parts[1] if len(parts) > 1 else ""
-    return text
+    if not text:
+        return ""
+    # Strip all leading <@...> mentions (sometimes there are multiple)
+    while True:
+        text = text.strip()
+        if text.startswith("<@") and ">" in text:
+            text = text.split(">", 1)[1]
+        else:
+            break
+    return text.strip()
+
+
+_bot_user_id_cache: str | None = None
+
+
+async def get_bot_user_id(client) -> str:
+    global _bot_user_id_cache
+    if _bot_user_id_cache:
+        return _bot_user_id_cache
+    try:
+        auth = await client.auth_test()
+        _bot_user_id_cache = auth["user_id"]
+        return _bot_user_id_cache
+    except Exception as e:
+        logger.warning("Failed to resolve bot user ID: %s", e)
+        return ""
+
+
+async def fetch_thread_history(client, channel: str, thread_ts: str, limit: int = 30) -> list[dict]:
+    """Fetch messages in a thread and convert to LLM message format."""
+    try:
+        result = await client.conversations_replies(channel=channel, ts=thread_ts, limit=limit)
+        bot_uid = await get_bot_user_id(client)
+        history: list[dict] = []
+        for msg in result.get("messages", []):
+            text = strip_bot_mention(msg.get("text", "") or "")
+            if not text:
+                continue
+            is_bot = msg.get("bot_id") or msg.get("user") == bot_uid
+            role = "assistant" if is_bot else "user"
+            history.append({"role": role, "content": text})
+        return history
+    except Exception as e:
+        logger.warning("Failed to fetch thread history for %s: %s", thread_ts, e)
+        return []
 
 
 # Slash command handler
@@ -327,7 +369,7 @@ async def slash_lazy(command, respond, client):
         return
     email = await resolve_user_email(client, command["user_id"])
     try:
-        result = await agent_loop(text, email, command["user_id"])
+        result = await agent_loop([{"role": "user", "content": text}], email, command["user_id"])
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
@@ -343,30 +385,45 @@ async def mention_ack(ack):
 
 
 async def mention_lazy(event, client):
+    # Reply in the existing thread if there is one, else start a new thread
+    reply_ts = event.get("thread_ts") or event["ts"]
+
     if not is_allowed_channel(event["channel"]):
         await client.chat_postMessage(
             channel=event["channel"],
-            thread_ts=event["ts"],
+            thread_ts=reply_ts,
             text="I only work in approved channels.",
         )
         return
-    text = strip_bot_mention(event.get("text", "")).strip()
+
+    text = strip_bot_mention(event.get("text", "") or "")
     if not text:
         await client.chat_postMessage(
             channel=event["channel"],
-            thread_ts=event["ts"],
+            thread_ts=reply_ts,
             text="Mention me with an instruction. Example: `@chatops create a ticket: API down`",
         )
         return
+
+    # If this is in an existing thread, fetch history for context
+    if event.get("thread_ts"):
+        history = await fetch_thread_history(client, event["channel"], event["thread_ts"])
+        # The latest message is already in the history (this mention's text).
+        # Make sure history isn't empty.
+        if not history:
+            history = [{"role": "user", "content": text}]
+    else:
+        history = [{"role": "user", "content": text}]
+
     email = await resolve_user_email(client, event["user"])
     try:
-        result = await agent_loop(text, email, event["user"])
+        result = await agent_loop(history, email, event["user"])
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
     await client.chat_postMessage(
         channel=event["channel"],
-        thread_ts=event["ts"],
+        thread_ts=reply_ts,
         text=result,
     )
 
