@@ -15,7 +15,7 @@ import os
 import re
 import uuid
 from contextlib import AsyncExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     allowed_channel_ids: str = ""
     port: int = 9001
     log_level: str = "INFO"
+
+    # Daily standup cron: hour (UTC) at which to DM each member their pending tickets.
+    # Set to a value in [0, 23] to enable; -1 (default) keeps the cron off.
+    standup_hour_utc: int = -1
 
     @property
     def allowed_channels(self) -> set[str]:
@@ -774,6 +778,38 @@ _MD_BOLD_RE = re.compile(r"\*\*([^\n*][^\n]*?)\*\*")
 _MD_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.*?)[ \t]*$", re.MULTILINE)
 
 
+HELP_TEXT = """*RemoteStar ChatOps* — what I can do:
+
+*Tickets*
+• `@chatops list my tickets` — your Todo tickets (default). Add "open" for in-progress too.
+• `@chatops list <user>'s tickets` — pending work for someone (mention them with @)
+• `@chatops create a ticket: <description>` — new ticket, auto-routed by keywords
+• `@chatops add a comment to RECRUITER-109: <text>` — comment on a ticket
+• `@chatops close RECRUITER-109` — mark done
+• `@chatops show me RECRUITER-109` — fetch a specific ticket
+
+*Search*
+• `@chatops find tickets about <topic>` — full-text search across both projects
+
+*Attachments*
+• Drop a screenshot in the same message OR earlier in the thread; I upload it to the issue and embed it inline in the description.
+
+*Reactions* (on my own messages)
+• :white_check_mark: → mark Done
+• :construction: → mark In Progress
+• :back: → move to Backlog
+• :x: → mark Cancelled
+
+*Channels*
+• Mention me in #product, or DM me directly. The slash command `/cs <text>` also works.
+"""
+
+
+def is_help_text(text: str) -> bool:
+    t = (text or "").strip().lower().rstrip("?").strip()
+    return t in {"help", "what can you do", "what do you do", "commands"}
+
+
 def to_slack_mrkdwn(text: str) -> str:
     """Best-effort conversion of common standard-markdown patterns the LLM
     sometimes emits into Slack's mrkdwn dialect. Safety net only — the system
@@ -913,51 +949,28 @@ async def mention_ack(ack):
     await ack()
 
 
-async def mention_lazy(event, client):
-    # Reply in the existing thread if there is one, else start a new thread
-    reply_ts = event.get("thread_ts") or event["ts"]
+async def handle_user_request(
+    client,
+    *,
+    channel: str,
+    user_id: str,
+    text: str,
+    files: list[dict],
+    thread_ts: str | None,
+    reply_ts: str | None,
+) -> None:
+    """Shared agent flow for both @mentions and DMs.
 
-    if not is_allowed_channel(event["channel"]):
-        await client.chat_postMessage(
-            channel=event["channel"],
-            thread_ts=reply_ts,
-            text="I only work in approved channels.",
-        )
-        return
-
-    text = strip_bot_mention(event.get("text", "") or "")
-    files = event.get("files") or []
-
-    # If the user is in a thread and didn't attach files directly to this message,
-    # pick up any files uploaded earlier in the thread.
-    if not files and event.get("thread_ts"):
-        files = await collect_thread_files(client, event["channel"], event["thread_ts"])
-        if files:
-            logger.info("Collected %d file(s) from thread context", len(files))
-
-    logger.info(
-        "Mention received: user=%s channel=%s text=%r files=%d",
-        event.get("user"), event.get("channel"), text[:120], len(files),
-    )
-    for f in files:
-        logger.info(
-            "  file: name=%r mime=%r size=%s has_url=%s",
-            f.get("name"), f.get("mimetype"), f.get("size"),
-            bool(f.get("url_private_download") or f.get("url_private")),
-        )
-
-    if not text and not files:
-        await client.chat_postMessage(
-            channel=event["channel"],
-            thread_ts=reply_ts,
-            text="Mention me with an instruction. Example: `@chatops create a ticket: API down`",
-        )
+    `reply_ts` is the thread to post into. For DMs we usually pass None to keep
+    replies flat. For app_mention in a thread we pass the thread_ts.
+    """
+    # Help short-circuit — deterministic, fast, no LLM call.
+    if is_help_text(text) and not files:
+        await client.chat_postMessage(channel=channel, thread_ts=reply_ts, text=HELP_TEXT)
         return
 
     text = await resolve_slack_mentions(client, text)
 
-    # Hint the LLM that attachments are present so it knows to create an issue.
-    # The LLM doesn't upload them; we do that after the loop returns.
     if files:
         names = ", ".join(f.get("name") or "file" for f in files)
         text = (text or "Create a ticket for this.") + (
@@ -965,10 +978,8 @@ async def mention_lazy(event, client):
             "These will be auto-attached to the new Plane issue after you create it.]"
         )
 
-    # If this is in an existing thread, fetch history for context
-    if event.get("thread_ts"):
-        history = await fetch_thread_history(client, event["channel"], event["thread_ts"])
-        # Replace the last user message with the mention-resolved version
+    if thread_ts:
+        history = await fetch_thread_history(client, channel, thread_ts)
         if history and history[-1]["role"] == "user":
             history[-1]["content"] = text
         else:
@@ -976,16 +987,20 @@ async def mention_lazy(event, client):
     else:
         history = [{"role": "user", "content": text}]
 
-    email = await resolve_user_email(client, event["user"])
+    email = await resolve_user_email(client, user_id)
     created_issue: dict | None = None
     try:
-        result, created_issue = await agent_loop(history, email, event["user"])
+        result, created_issue = await agent_loop(history, email, user_id)
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
 
     if files:
-        if created_issue and _looks_like_uuid(created_issue.get("issue_id")) and _looks_like_uuid(created_issue.get("project_id")):
+        if (
+            created_issue
+            and _looks_like_uuid(created_issue.get("issue_id"))
+            and _looks_like_uuid(created_issue.get("project_id"))
+        ):
             uploaded, total = await attach_slack_files_to_plane_issue(
                 files, created_issue["project_id"], created_issue["issue_id"]
             )
@@ -1005,13 +1020,199 @@ async def mention_lazy(event, client):
             )
 
     await client.chat_postMessage(
-        channel=event["channel"],
+        channel=channel,
         thread_ts=reply_ts,
         text=to_slack_mrkdwn(result),
     )
 
 
+async def mention_lazy(event, client):
+    reply_ts = event.get("thread_ts") or event["ts"]
+
+    if not is_allowed_channel(event["channel"]):
+        await client.chat_postMessage(
+            channel=event["channel"],
+            thread_ts=reply_ts,
+            text="I only work in approved channels. DM me directly for anything else.",
+        )
+        return
+
+    text = strip_bot_mention(event.get("text", "") or "")
+    files = event.get("files") or []
+
+    if not files and event.get("thread_ts"):
+        files = await collect_thread_files(client, event["channel"], event["thread_ts"])
+        if files:
+            logger.info("Collected %d file(s) from thread context", len(files))
+
+    logger.info(
+        "Mention received: user=%s channel=%s text=%r files=%d",
+        event.get("user"), event.get("channel"), text[:120], len(files),
+    )
+
+    if not text and not files:
+        await client.chat_postMessage(
+            channel=event["channel"],
+            thread_ts=reply_ts,
+            text="Mention me with an instruction. Try `@chatops help`.",
+        )
+        return
+
+    await handle_user_request(
+        client,
+        channel=event["channel"],
+        user_id=event["user"],
+        text=text,
+        files=files,
+        thread_ts=event.get("thread_ts"),
+        reply_ts=reply_ts,
+    )
+
+
 slack_app.event("app_mention")(ack=mention_ack, lazy=[mention_lazy])
+
+
+# DM handler — bot is allowed to chat in any DM regardless of allowed_channels
+async def dm_ack(ack):
+    await ack()
+
+
+async def dm_lazy(event, client):
+    if event.get("channel_type") != "im":
+        return  # not a DM; ignore
+    if event.get("bot_id") or event.get("subtype"):
+        return  # ignore bots and message edits/joins/etc
+    bot_uid = await get_bot_user_id(client)
+    if event.get("user") == bot_uid:
+        return  # ignore our own messages
+
+    text = (event.get("text") or "").strip()
+    files = event.get("files") or []
+    if not text and not files:
+        return
+
+    logger.info(
+        "DM received: user=%s text=%r files=%d",
+        event.get("user"), text[:120], len(files),
+    )
+
+    await handle_user_request(
+        client,
+        channel=event["channel"],
+        user_id=event["user"],
+        text=text,
+        files=files,
+        thread_ts=event.get("thread_ts"),
+        reply_ts=event.get("thread_ts"),  # keep reply flat unless already in a thread
+    )
+
+
+slack_app.event("message")(ack=dm_ack, lazy=[dm_lazy])
+
+
+# Reaction-driven status changes — react to the bot's own ticket messages
+EMOJI_TO_STATE_GROUP: dict[str, str] = {
+    "white_check_mark": "completed",
+    "heavy_check_mark": "completed",
+    "construction": "started",
+    "hammer_and_wrench": "started",
+    "back": "backlog",
+    "x": "cancelled",
+    "no_entry_sign": "cancelled",
+}
+
+# Match a Plane issue URL (works for both the encoded and decoded forms Slack stores)
+_ISSUE_URL_RE = re.compile(
+    r"plane\.remotestar\.io/[^/\s>|]+/projects/([0-9a-f-]{36})/issues/([0-9a-f-]{36})",
+    re.IGNORECASE,
+)
+
+
+def _pick_state_for_group(project_id: str, target_group: str) -> str | None:
+    """Pick the canonical state UUID for a (project_id, state_group). If multiple
+    states share the group (e.g. Staging/Production/Done are all 'completed'),
+    prefer the one named Done > In Progress > Backlog > anything else."""
+    candidates = [
+        (sid, info) for sid, info in plane_states_cache.items()
+        if info.get("project_id") == project_id
+        and (info.get("group") or "").lower() == target_group
+    ]
+    if not candidates:
+        return None
+    PREF_NAMES = {"done", "in progress", "todo", "backlog", "cancelled"}
+    for sid, info in candidates:
+        if (info.get("name") or "").strip().lower() in PREF_NAMES:
+            return sid
+    return candidates[0][0]
+
+
+async def reaction_ack(ack):
+    await ack()
+
+
+async def reaction_lazy(event, client):
+    emoji = event.get("reaction")
+    target_group = EMOJI_TO_STATE_GROUP.get(emoji)
+    if not target_group:
+        return
+
+    item = event.get("item") or {}
+    if item.get("type") != "message":
+        return
+    channel = item.get("channel")
+    msg_ts = item.get("ts")
+    if not channel or not msg_ts:
+        return
+
+    try:
+        history = await client.conversations_history(
+            channel=channel, latest=msg_ts, limit=1, inclusive=True
+        )
+        msgs = history.get("messages") or []
+        if not msgs:
+            return
+        msg = msgs[0]
+    except Exception as e:
+        logger.warning("Could not fetch reacted message: %s", e)
+        return
+
+    bot_uid = await get_bot_user_id(client)
+    if msg.get("user") != bot_uid and not msg.get("bot_id"):
+        return  # only act on our own messages
+
+    text = msg.get("text") or ""
+    m = _ISSUE_URL_RE.search(text)
+    if not m:
+        return
+    project_id, issue_id = m.group(1), m.group(2)
+
+    state_id = _pick_state_for_group(project_id, target_group)
+    if not state_id:
+        logger.warning("No %s state cached for project %s", target_group, project_id)
+        return
+
+    logger.info(
+        "Reaction :%s: from %s -> set state group %s on %s/%s",
+        emoji, event.get("user"), target_group, project_id, issue_id,
+    )
+    result = await mcp.call("plane__update_work_item", {
+        "project_id": project_id,
+        "work_item_id": issue_id,
+        "state": state_id,
+    })
+    state_name = (plane_states_cache.get(state_id) or {}).get("name") or target_group
+    try:
+        json.loads(result)  # if it parses, the update worked
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=msg_ts,
+            text=f"Marked as *{state_name}* via :{emoji}: from <@{event.get('user')}>.",
+        )
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("update_work_item returned unexpected result: %s", result[:200])
+
+
+slack_app.event("reaction_added")(ack=reaction_ack, lazy=[reaction_lazy])
 
 
 # ---------------------------------------------------------------------------
@@ -1032,6 +1233,75 @@ async def health():
     return {"status": "ok", "mcp_servers": list(mcp._sessions.keys())}
 
 
+async def run_standup_once() -> None:
+    """For each cached Plane member, DM them their pending tickets (Todo + In Progress)."""
+    if not plane_members_cache:
+        logger.info("Standup skipped: no cached members")
+        return
+    sent = 0
+    for member in plane_members_cache:
+        email = member.get("email")
+        if not email:
+            continue
+        try:
+            lookup = await slack_app.client.users_lookupByEmail(email=email)
+        except Exception as e:
+            logger.info("Standup: no Slack account for %s (%s)", email, e)
+            continue
+        slack_user_id = (lookup.get("user") or {}).get("id")
+        if not slack_user_id:
+            continue
+
+        result_text = await _chatops_list_assigned_tickets({
+            "assignee_email": email,
+            "state_groups": ["unstarted", "started"],
+        })
+        try:
+            data = json.loads(result_text)
+        except json.JSONDecodeError:
+            continue
+        tickets = data.get("tickets") or []
+        if not tickets:
+            continue
+
+        lines = [f"*Daily standup* — you have {len(tickets)} pending ticket(s):"]
+        for t in tickets:
+            state = t.get("state") or "?"
+            lines.append(f"• *{t['key']}* — <{t['url']}|{t.get('name') or '(no title)'}> _({state})_")
+        msg = "\n".join(lines)
+        try:
+            await slack_app.client.chat_postMessage(channel=slack_user_id, text=msg)
+            sent += 1
+        except Exception as e:
+            logger.warning("Standup: failed to DM %s: %s", email, e)
+    logger.info("Standup: posted to %d user(s)", sent)
+
+
+async def standup_loop() -> None:
+    """Sleep until the next standup_hour_utc, run, repeat."""
+    target_hour = settings.standup_hour_utc
+    if not (0 <= target_hour <= 23):
+        return
+    while True:
+        now = datetime.now(timezone.utc)
+        next_run = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        sleep_secs = (next_run - now).total_seconds()
+        logger.info("Standup scheduled for %s UTC (in %.0f s)", next_run.isoformat(), sleep_secs)
+        try:
+            await asyncio.sleep(sleep_secs)
+        except asyncio.CancelledError:
+            return
+        try:
+            await run_standup_once()
+        except Exception as e:
+            logger.error("Standup run failed: %s", e, exc_info=True)
+
+
+_background_tasks: list[asyncio.Task] = []
+
+
 @api.on_event("startup")
 async def on_startup() -> None:
     global mongo_client
@@ -1047,9 +1317,14 @@ async def on_startup() -> None:
     await refresh_plane_members()
     await refresh_plane_states()
 
+    if 0 <= settings.standup_hour_utc <= 23:
+        _background_tasks.append(asyncio.create_task(standup_loop()))
+
 
 @api.on_event("shutdown")
 async def on_shutdown() -> None:
+    for t in _background_tasks:
+        t.cancel()
     await mcp.stop()
     if mongo_client:
         mongo_client.close()
