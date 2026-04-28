@@ -186,6 +186,9 @@ PLANE_HOST = settings.plane_base_url.rstrip("/")
 # Cached list of Plane workspace members: [{id, email, display_name}, ...]
 plane_members_cache: list[dict] = []
 
+# Cached Plane states: state_uuid -> {name, group, project_id}
+plane_states_cache: dict[str, dict] = {}
+
 
 # ---------------------------------------------------------------------------
 # Local (chatops__*) tools — implemented in this process, exposed to the LLM
@@ -205,7 +208,8 @@ LOCAL_TOOL_DEFS: list[dict] = [
                 "ALWAYS prefer this over plane__list_work_items for any 'list X's tickets' / "
                 "'list my tickets' / 'show me what is assigned to ...' request, because "
                 "passing assignee_ids to plane__list_work_items routes through Plane's "
-                "advanced-search endpoint which is forbidden for our API key."
+                "advanced-search endpoint which is forbidden for our API key. "
+                "By default returns only Todo (state_group=unstarted) tickets."
             ),
             "parameters": {
                 "type": "object",
@@ -218,6 +222,18 @@ LOCAL_TOOL_DEFS: list[dict] = [
                         "type": "string",
                         "enum": ["CANDIDATE", "RECRUITER", "ALL"],
                         "description": "Limit to one project, or ALL (default).",
+                    },
+                    "state_groups": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["backlog", "unstarted", "started", "completed", "cancelled"],
+                        },
+                        "description": (
+                            "Which Plane state groups to include. Default ['unstarted'] which is 'Todo'. "
+                            "Pass ['unstarted','started'] for 'open' / 'pending'. "
+                            "Pass [] (empty array) to include every state."
+                        ),
                     },
                 },
                 "required": ["assignee_email"],
@@ -243,6 +259,11 @@ async def _chatops_list_assigned_tickets(args: dict) -> str:
     target_uuid = target["id"]
     proj_filter = (args.get("project") or "ALL").upper()
 
+    state_groups = args.get("state_groups")
+    if state_groups is None:
+        state_groups = ["unstarted"]  # default = Todo
+    state_filter = {s.lower() for s in state_groups if isinstance(s, str)}
+
     project_pairs: list[tuple[str, str]] = []
     if proj_filter in ("RECRUITER", "ALL"):
         project_pairs.append(("RECRUITER", settings.plane_project_recruiter))
@@ -267,8 +288,6 @@ async def _chatops_list_assigned_tickets(args: dict) -> str:
             except (json.JSONDecodeError, TypeError):
                 logger.warning("list_work_items returned non-JSON for %s page %d", ident, page)
                 break
-            # The Plane MCP unwraps the response to a bare list; older versions
-            # might return {"results": [...]}. Handle both.
             if isinstance(data, list):
                 items = data
             elif isinstance(data, dict):
@@ -280,20 +299,36 @@ async def _chatops_list_assigned_tickets(args: dict) -> str:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                if target_uuid in (item.get("assignees") or []):
-                    matches.append({
-                        "key": f"{ident}-{item.get('sequence_id')}",
-                        "name": item.get("name"),
-                        "id": item.get("id"),
-                        "project": ident,
-                        "state_id": item.get("state"),
-                    })
+                if target_uuid not in (item.get("assignees") or []):
+                    continue
+                state_id = item.get("state")
+                state_meta = plane_states_cache.get(state_id) or {}
+                state_group = (state_meta.get("group") or "").lower()
+                if state_filter and state_group not in state_filter:
+                    continue
+                seq = item.get("sequence_id")
+                issue_id = item.get("id")
+                matches.append({
+                    "key": f"{ident}-{seq}",
+                    "name": item.get("name"),
+                    "url": (
+                        f"{PLANE_HOST}/{settings.plane_workspace_slug}"
+                        f"/projects/{proj_id}/issues/{issue_id}/"
+                    ),
+                    "project": ident,
+                    "state": state_meta.get("name"),
+                    "state_group": state_group or None,
+                })
             if len(items) < PER_PAGE:
                 break  # last page
-    logger.info("chatops__list_assigned_tickets: %s -> %d match(es)", email, len(matches))
+    logger.info(
+        "chatops__list_assigned_tickets: %s state_groups=%s -> %d match(es)",
+        email, sorted(state_filter) if state_filter else "ALL", len(matches),
+    )
     return json.dumps({
         "assignee_email": email,
         "assignee_name": target.get("display_name"),
+        "state_groups": sorted(state_filter) if state_filter else "ALL",
         "count": len(matches),
         "tickets": matches,
     })
@@ -302,6 +337,28 @@ async def _chatops_list_assigned_tickets(args: dict) -> str:
 LOCAL_TOOL_HANDLERS = {
     "chatops__list_assigned_tickets": _chatops_list_assigned_tickets,
 }
+
+
+async def refresh_plane_states() -> None:
+    """Cache state metadata per project: state_uuid -> {name, group, project_id}."""
+    global plane_states_cache
+    new_cache: dict[str, dict] = {}
+    for proj_id in (settings.plane_project_recruiter, settings.plane_project_candidate):
+        try:
+            text = await mcp.call("plane__list_states", {"project_id": proj_id})
+            data = json.loads(text)
+            items = data if isinstance(data, list) else (data.get("results") or [] if isinstance(data, dict) else [])
+            for s in items:
+                if isinstance(s, dict) and s.get("id"):
+                    new_cache[s["id"]] = {
+                        "name": s.get("name"),
+                        "group": s.get("group"),
+                        "project_id": proj_id,
+                    }
+        except Exception as e:
+            logger.warning("Failed to fetch states for project %s: %s", proj_id, e)
+    plane_states_cache = new_cache
+    logger.info("Cached %d Plane states across both projects", len(plane_states_cache))
 
 
 async def refresh_plane_members() -> None:
@@ -960,6 +1017,7 @@ async def on_startup() -> None:
             mongo_client = None
     await mcp.start()
     await refresh_plane_members()
+    await refresh_plane_states()
 
 
 @api.on_event("shutdown")
