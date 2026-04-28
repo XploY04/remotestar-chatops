@@ -243,12 +243,18 @@ def build_system_prompt() -> str:
 - If you can't find a matching member, tell the user clearly: "I couldn't find a Plane user with email X — please check they're in the workspace."
 - If the user only gave a name (not email), look up by display_name in the members map; if multiple match, ask which one.
 
-## Listing and searching work items
-- `plane__list_work_items` requires EITHER `project_id` OR `workspace_search: true`. Calling it without one returns HTTP 403.
-- For "list my tickets" / "show all open recruiter tickets" across both projects, pass `workspace_search: true` plus your filters (e.g. `assignee_ids`, `state_groups`).
-- For "list tickets in CANDIDATE" / "in RECRUITER", pass the matching `project_id`.
-- For free-text search ("find tickets about login"), use `plane__search_work_items` with a `query`. That is workspace-wide by default.
-- For "show me RECRUITER-106" / "PROJ-NN" lookups, use `plane__retrieve_work_item_by_identifier` with `project_identifier` (RECRUITER or CANDIDATE) and `issue_identifier` (the integer sequence number).
+## Listing and searching work items (READ THIS CAREFULLY)
+Our API key has a hard limitation: ANY filter parameter on `plane__list_work_items` (assignee_ids, state_ids, state_groups, priorities, label_ids, type_ids, cycle_ids, module_ids, created_by_ids, query, workspace_search, etc.) routes through Plane's `/work-items/advanced-search/` endpoint which returns HTTP 403 for our key. Do NOT pass any of those filters — the call will always fail.
+
+What works:
+- **`plane__list_work_items` with ONLY `project_id`** (no other filters) — returns all issues in that project. Use pagination (`per_page`, `cursor`) for large projects.
+- **`plane__search_work_items` with a `query`** — free-text workspace-wide search across name and description. Use this when the user gives a topic like "find tickets about login bug".
+- **`plane__retrieve_work_item_by_identifier`** with `project_identifier` (RECRUITER or CANDIDATE) and `issue_identifier` (the integer sequence number) — for "show me RECRUITER-106" lookups.
+
+How to handle common requests:
+- "list my tickets" / "list <user>'s tickets" → call `list_work_items(project_id=...)` for each project WITHOUT filters, then filter client-side by reading the `assignees` field on each result against the target user's UUID. Be efficient: use `fields="id,name,sequence_id,assignees,state"` to keep payloads small.
+- "find tickets about X" → use `search_work_items(query="X")`.
+- "show me RECRUITER-106" → use `retrieve_work_item_by_identifier`.
 
 Project identifiers for `retrieve_work_item_by_identifier`:
 - `RECRUITER` → recruiter project (UUID: `{settings.plane_project_recruiter}`)
