@@ -187,6 +187,112 @@ PLANE_HOST = settings.plane_base_url.rstrip("/")
 plane_members_cache: list[dict] = []
 
 
+# ---------------------------------------------------------------------------
+# Local (chatops__*) tools — implemented in this process, exposed to the LLM
+# alongside MCP tools. We use these for things the Plane API key can't do
+# (e.g. server-side filtering by assignee, which goes through an OAuth-only
+# endpoint we get 403 on).
+# ---------------------------------------------------------------------------
+
+
+LOCAL_TOOL_DEFS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "chatops__list_assigned_tickets",
+            "description": (
+                "List Plane work items assigned to a specific user, filtered server-side. "
+                "ALWAYS prefer this over plane__list_work_items for any 'list X's tickets' / "
+                "'list my tickets' / 'show me what is assigned to ...' request, because "
+                "passing assignee_ids to plane__list_work_items routes through Plane's "
+                "advanced-search endpoint which is forbidden for our API key."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "assignee_email": {
+                        "type": "string",
+                        "description": "Plane email of the assignee. For 'my tickets', use the requesting user's email shown in the system prompt.",
+                    },
+                    "project": {
+                        "type": "string",
+                        "enum": ["CANDIDATE", "RECRUITER", "ALL"],
+                        "description": "Limit to one project, or ALL (default).",
+                    },
+                },
+                "required": ["assignee_email"],
+            },
+        },
+    }
+]
+
+
+async def _chatops_list_assigned_tickets(args: dict) -> str:
+    email = (args.get("assignee_email") or "").lower().strip()
+    if not email:
+        return json.dumps({"error": "assignee_email is required"})
+    target = next(
+        (m for m in plane_members_cache if (m.get("email") or "").lower() == email),
+        None,
+    )
+    if not target:
+        return json.dumps({
+            "error": f"No Plane member with email {email!r}.",
+            "available_emails": [m["email"] for m in plane_members_cache],
+        })
+    target_uuid = target["id"]
+    proj_filter = (args.get("project") or "ALL").upper()
+
+    project_pairs: list[tuple[str, str]] = []
+    if proj_filter in ("RECRUITER", "ALL"):
+        project_pairs.append(("RECRUITER", settings.plane_project_recruiter))
+    if proj_filter in ("CANDIDATE", "ALL"):
+        project_pairs.append(("CANDIDATE", settings.plane_project_candidate))
+
+    matches: list[dict] = []
+    for ident, proj_id in project_pairs:
+        cursor = None
+        for _ in range(20):  # safety: cap pagination
+            params: dict = {
+                "project_id": proj_id,
+                "per_page": 100,
+                "fields": "id,name,sequence_id,assignees,state",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            text = await mcp.call("plane__list_work_items", params)
+            try:
+                data = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                break
+            if not isinstance(data, dict):
+                break
+            for item in data.get("results") or []:
+                if target_uuid in (item.get("assignees") or []):
+                    matches.append({
+                        "key": f"{ident}-{item.get('sequence_id')}",
+                        "name": item.get("name"),
+                        "id": item.get("id"),
+                        "project": ident,
+                        "state_id": item.get("state"),
+                    })
+            if not data.get("next_page_results"):
+                break
+            cursor = data.get("next_cursor")
+    logger.info("chatops__list_assigned_tickets: %s -> %d match(es)", email, len(matches))
+    return json.dumps({
+        "assignee_email": email,
+        "assignee_name": target.get("display_name"),
+        "count": len(matches),
+        "tickets": matches,
+    })
+
+
+LOCAL_TOOL_HANDLERS = {
+    "chatops__list_assigned_tickets": _chatops_list_assigned_tickets,
+}
+
+
 async def refresh_plane_members() -> None:
     """Fetch workspace members from Plane and cache."""
     global plane_members_cache
@@ -252,9 +358,10 @@ What works:
 - **`plane__retrieve_work_item_by_identifier`** with `project_identifier` (RECRUITER or CANDIDATE) and `issue_identifier` (the integer sequence number) — for "show me RECRUITER-106" lookups.
 
 How to handle common requests:
-- "list my tickets" / "list <user>'s tickets" → call `list_work_items(project_id=...)` for each project WITHOUT filters, then filter client-side by reading the `assignees` field on each result against the target user's UUID. Be efficient: use `fields="id,name,sequence_id,assignees,state"` to keep payloads small.
-- "find tickets about X" → use `search_work_items(query="X")`.
-- "show me RECRUITER-106" → use `retrieve_work_item_by_identifier`.
+- "list my tickets" / "list <user>'s tickets" / "what is assigned to X" → ALWAYS use `chatops__list_assigned_tickets`. It takes an `assignee_email` and (optionally) a `project` and returns only the matching items — server-side filtering, no token waste. Resolve `<user>` to an email first using the workspace members list above (or the requesting user's email for "my tickets").
+- "find tickets about X" → use `plane__search_work_items(query="X")`.
+- "show me RECRUITER-106" → use `plane__retrieve_work_item_by_identifier`.
+- Only fall back to `plane__list_work_items(project_id=...)` (no filters) when you genuinely need every issue in a project.
 
 Project identifiers for `retrieve_work_item_by_identifier`:
 - `RECRUITER` → recruiter project (UUID: `{settings.plane_project_recruiter}`)
@@ -312,7 +419,7 @@ async def agent_loop(
         *history,
     ]
 
-    tools = mcp.openai_tools()
+    tools = mcp.openai_tools() + LOCAL_TOOL_DEFS
     if not tools:
         return "I'm not connected to any backends right now. Try again in a moment.", None
 
@@ -355,7 +462,14 @@ async def agent_loop(
             except json.JSONDecodeError:
                 args = {}
             logger.info("Tool call: %s args=%s", tc.function.name, args)
-            result = await mcp.call(tc.function.name, args)
+            if tc.function.name in LOCAL_TOOL_HANDLERS:
+                try:
+                    result = await LOCAL_TOOL_HANDLERS[tc.function.name](args)
+                except Exception as e:
+                    logger.error("Local tool %s crashed: %s", tc.function.name, e, exc_info=True)
+                    result = json.dumps({"error": str(e)})
+            else:
+                result = await mcp.call(tc.function.name, args)
             tool_call_log.append({"name": tc.function.name, "args": args, "result_preview": result[:200]})
 
             # Capture the issue id so we can attach files after the loop.
