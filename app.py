@@ -258,6 +258,9 @@ For `description_html`, format as HTML with the user's content followed by an at
 <p><em>Created via ChatOps by {{user_email}} at {{timestamp_iso}}</em></p>
 ```
 
+## Slack file attachments (IMPORTANT)
+If the user message mentions that files were attached in Slack (you'll see `[The user attached N file(s) in Slack: ...]`), do NOT apologize or say you can't attach them. The host application uploads those files to the Plane issue automatically AFTER you finish creating the work item — you don't need to (and can't) call any attachment tool yourself. Just create the work item normally; the system handles the rest.
+
 ## Tool naming
 Tools are prefixed with `<server>__<tool>`. For Plane tools, use the `plane__*` names.
 
@@ -589,6 +592,17 @@ async def mention_lazy(event, client):
 
     text = strip_bot_mention(event.get("text", "") or "")
     files = event.get("files") or []
+    logger.info(
+        "Mention received: user=%s channel=%s text=%r files=%d",
+        event.get("user"), event.get("channel"), text[:120], len(files),
+    )
+    if files:
+        for f in files:
+            logger.info(
+                "  file: name=%r mime=%r size=%s url=%s",
+                f.get("name"), f.get("mimetype"), f.get("size"),
+                bool(f.get("url_private_download") or f.get("url_private")),
+            )
 
     if not text and not files:
         await client.chat_postMessage(
