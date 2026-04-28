@@ -525,6 +525,25 @@ async def get_bot_user_id(client) -> str:
         return ""
 
 
+async def collect_thread_files(client, channel: str, thread_ts: str, limit: int = 30) -> list[dict]:
+    """Scan a thread for any uploaded files (skipping the bot's own messages)."""
+    try:
+        result = await client.conversations_replies(channel=channel, ts=thread_ts, limit=limit)
+        if not result.get("ok"):
+            return []
+        bot_uid = await get_bot_user_id(client)
+        files: list[dict] = []
+        for msg in result.get("messages", []):
+            if msg.get("user") == bot_uid or msg.get("bot_id"):
+                continue
+            for f in msg.get("files") or []:
+                files.append(f)
+        return files
+    except Exception as e:
+        logger.warning("Failed to collect thread files: %s", e, exc_info=True)
+        return []
+
+
 async def fetch_thread_history(client, channel: str, thread_ts: str, limit: int = 30) -> list[dict]:
     """Fetch messages in a thread and convert to LLM message format."""
     try:
@@ -592,17 +611,24 @@ async def mention_lazy(event, client):
 
     text = strip_bot_mention(event.get("text", "") or "")
     files = event.get("files") or []
+
+    # If the user is in a thread and didn't attach files directly to this message,
+    # pick up any files uploaded earlier in the thread.
+    if not files and event.get("thread_ts"):
+        files = await collect_thread_files(client, event["channel"], event["thread_ts"])
+        if files:
+            logger.info("Collected %d file(s) from thread context", len(files))
+
     logger.info(
         "Mention received: user=%s channel=%s text=%r files=%d",
         event.get("user"), event.get("channel"), text[:120], len(files),
     )
-    if files:
-        for f in files:
-            logger.info(
-                "  file: name=%r mime=%r size=%s url=%s",
-                f.get("name"), f.get("mimetype"), f.get("size"),
-                bool(f.get("url_private_download") or f.get("url_private")),
-            )
+    for f in files:
+        logger.info(
+            "  file: name=%r mime=%r size=%s has_url=%s",
+            f.get("name"), f.get("mimetype"), f.get("size"),
+            bool(f.get("url_private_download") or f.get("url_private")),
+        )
 
     if not text and not files:
         await client.chat_postMessage(
