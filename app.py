@@ -339,6 +339,9 @@ async def fetch_thread_history(client, channel: str, thread_ts: str, limit: int 
     """Fetch messages in a thread and convert to LLM message format."""
     try:
         result = await client.conversations_replies(channel=channel, ts=thread_ts, limit=limit)
+        if not result.get("ok"):
+            logger.warning("conversations.replies returned ok=false: %s", result.data)
+            return []
         bot_uid = await get_bot_user_id(client)
         history: list[dict] = []
         for msg in result.get("messages", []):
@@ -350,7 +353,7 @@ async def fetch_thread_history(client, channel: str, thread_ts: str, limit: int 
             history.append({"role": role, "content": text})
         return history
     except Exception as e:
-        logger.warning("Failed to fetch thread history for %s: %s", thread_ts, e)
+        logger.warning("Failed to fetch thread history for %s: %s", thread_ts, e, exc_info=True)
         return []
 
 
