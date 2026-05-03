@@ -193,6 +193,10 @@ plane_members_cache: list[dict] = []
 # Cached Plane states: state_uuid -> {name, group, project_id}
 plane_states_cache: dict[str, dict] = {}
 
+# Per-channel custom context, loaded from channel_profiles.json at the repo root.
+# Keys are Slack channel IDs, values are {label, instructions, ...}.
+channel_profiles: dict[str, dict] = {}
+
 
 # ---------------------------------------------------------------------------
 # Local (chatops__*) tools — implemented in this process, exposed to the LLM
@@ -343,6 +347,37 @@ LOCAL_TOOL_HANDLERS = {
 }
 
 
+def load_channel_profiles() -> None:
+    """Load per-channel instructions from channel_profiles.json next to this file."""
+    global channel_profiles
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_profiles.json")
+    if not os.path.exists(path):
+        logger.info("channel_profiles.json not found; using default context for all channels")
+        channel_profiles = {}
+        return
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("channel_profiles.json must contain an object at the top level")
+        cleaned: dict[str, dict] = {}
+        for cid, profile in data.items():
+            # Skip documentation stubs whose keys start with underscore
+            if not isinstance(cid, str) or cid.startswith("_"):
+                continue
+            if isinstance(profile, dict):
+                cleaned[cid] = profile
+        channel_profiles = cleaned
+        logger.info(
+            "Loaded %d channel profile(s): %s",
+            len(channel_profiles),
+            ", ".join(f"{cid}={p.get('label','?')}" for cid, p in channel_profiles.items()),
+        )
+    except Exception as e:
+        logger.warning("Failed to load channel_profiles.json: %s", e)
+        channel_profiles = {}
+
+
 async def refresh_plane_states() -> None:
     """Cache state metadata per project: state_uuid -> {name, group, project_id}."""
     global plane_states_cache
@@ -392,7 +427,7 @@ async def refresh_plane_members() -> None:
         logger.warning("Failed to fetch Plane members: %s", e)
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(channel_id: str | None = None) -> str:
     members_block = ""
     if plane_members_cache:
         rows = "\n".join(f"- `{m['email']}` → `{m['id']}` ({m.get('display_name', '')})" for m in plane_members_cache)
@@ -482,11 +517,32 @@ When listing tickets, render each as one line:
 ## User assistance
 - Be concise. After creating an issue, give the URL using the format above.
 - If a tool fails, explain the error in plain English and suggest a fix.
-"""
+{_channel_block(channel_id)}"""
+
+
+def _channel_block(channel_id: str | None) -> str:
+    if not channel_id:
+        return ""
+    profile = channel_profiles.get(channel_id)
+    if not profile:
+        return ""
+    label = profile.get("label", "this channel")
+    instructions = (profile.get("instructions") or "").strip()
+    if not instructions:
+        return ""
+    return (
+        f"\n## Channel context — #{label}\n"
+        f"You're currently responding in Slack channel #{label}. The instructions below are "
+        f"specific to this channel and override the generic guidance above when there's a conflict.\n\n"
+        f"{instructions}\n"
+    )
 
 
 async def agent_loop(
-    history: list[dict], user_email: str, user_slack_id: str
+    history: list[dict],
+    user_email: str,
+    user_slack_id: str,
+    channel_id: str | None = None,
 ) -> tuple[str, dict | None]:
     """history is a list of {role, content} dicts. Last item is the current user request.
 
@@ -495,7 +551,7 @@ async def agent_loop(
     call, or None if no issue was created.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
-    system = build_system_prompt() + f"\n\n## Current request\n- User email: {user_email}\n- User Slack ID: {user_slack_id}\n- Timestamp: {now_iso}\n"
+    system = build_system_prompt(channel_id) + f"\n\n## Current request\n- User email: {user_email}\n- User Slack ID: {user_slack_id}\n- Timestamp: {now_iso}\n"
 
     messages: list[dict] = [
         {"role": "system", "content": system},
@@ -823,8 +879,12 @@ def to_slack_mrkdwn(text: str) -> str:
 
 
 def is_allowed_channel(channel_id: str) -> bool:
+    # Channels with a profile are always allowed (they're explicitly configured)
+    if channel_id in channel_profiles:
+        return True
+    # Otherwise fall back to the env-var allowlist; empty allowlist = allow everywhere
     if not settings.allowed_channels:
-        return True  # if not configured, allow everywhere
+        return True
     return channel_id in settings.allowed_channels
 
 
@@ -934,7 +994,12 @@ async def slash_lazy(command, respond, client):
     text = await resolve_slack_mentions(client, text)
     email = await resolve_user_email(client, command["user_id"])
     try:
-        result, _created = await agent_loop([{"role": "user", "content": text}], email, command["user_id"])
+        result, _created = await agent_loop(
+            [{"role": "user", "content": text}],
+            email,
+            command["user_id"],
+            channel_id=command["channel_id"],
+        )
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
@@ -990,7 +1055,7 @@ async def handle_user_request(
     email = await resolve_user_email(client, user_id)
     created_issue: dict | None = None
     try:
-        result, created_issue = await agent_loop(history, email, user_id)
+        result, created_issue = await agent_loop(history, email, user_id, channel_id=channel)
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
@@ -1316,6 +1381,7 @@ async def on_startup() -> None:
     await mcp.start()
     await refresh_plane_members()
     await refresh_plane_states()
+    load_channel_profiles()
 
     if 0 <= settings.standup_hour_utc <= 23:
         _background_tasks.append(asyncio.create_task(standup_loop()))
