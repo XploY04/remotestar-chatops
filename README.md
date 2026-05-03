@@ -149,9 +149,36 @@ journalctl -u chatops -f  # tail logs
 - In `#product`: `/cs create a test ticket: Hello from ChatOps`
 - Bot replies in channel within 5-15 seconds with a link to the new Plane issue
 
-## Project routing
+## Channel modes and the `instructions/` directory
 
-The bot has two Plane projects configured:
+The bot runs in one of two modes per channel:
+
+- **plane** — full Plane MCP toolset, attachment uploads, reaction-driven status. For engineering teams using Plane.
+- **chatbot** — no tools, no attachments, no reactions. A general-purpose assistant with channel-specific context. For teams that don't use Plane (marketing, BD, sales, etc.).
+
+There is no default mode. The bot only responds in channels that have an instructions file:
+
+```
+instructions/
+├── plane/
+│   ├── <channel_id>.md     # one file per Plane-mode channel
+│   └── dm.md               # if present, DMs run in plane mode
+└── chatbot/
+    ├── <channel_id>.md     # one file per chatbot-mode channel
+    └── dm.md               # if present, DMs run in chatbot mode
+```
+
+- Filename = the Slack channel ID (e.g. `C0B0E9R0PE0.md`); the file's contents are appended verbatim to the system prompt as that channel's custom context.
+- Mode comes from the parent directory.
+- `dm.md` is a special filename. Whichever subdirectory it sits in defines DM behavior. If both `plane/dm.md` and `chatbot/dm.md` exist, the bot logs a warning and uses `plane/dm.md`. If neither exists, DMs are ignored.
+- A channel without a file gets no response from the bot — silent, no fallback.
+- After editing the directory: `systemctl restart chatops`. Hot reload is a future enhancement.
+
+Find the channel IDs with the throwaway script described in `.claude/plans/luminous-conjuring-dongarra.md` (uses `conversations.list`).
+
+## Plane project routing
+
+In Plane mode, the bot routes tickets between two projects:
 
 - **CANDIDATE** — candidate-facing app, profiles, jobs, interviews
 - **RECRUITER** — recruiter dashboard, hiring flows, ATS
@@ -171,7 +198,7 @@ Useful for debugging and seeing who did what.
 ## Adding a new service (e.g. GitHub)
 
 1. Get a GitHub PAT or set up a GitHub App
-2. Add to `MCP_SERVERS` in `app.py`:
+2. Add to `MCP_SERVERS` in `app/plane.py`:
 
 ```python
 MCP_SERVERS["github"] = StdioServerParameters(
@@ -182,10 +209,10 @@ MCP_SERVERS["github"] = StdioServerParameters(
 ```
 
 3. Add `GITHUB_PAT` to `.env`
-4. Update the system prompt in `SYSTEM_PROMPT` to mention GitHub
+4. Update the system prompt in `app/prompts.py` to mention GitHub
 5. Restart: `systemctl restart chatops`
 
-That's it — the LLM auto-discovers GitHub tools and starts using them.
+The LLM auto-discovers GitHub tools and starts using them in any Plane-mode channel.
 
 ## Tech stack
 

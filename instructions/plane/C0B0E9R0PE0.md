@@ -1,0 +1,1 @@
+Engineering channel. Tickets here are for the RECRUITER (recruiter platform) or CANDIDATE (candidate platform) Plane projects — pick by keyword as described above. Default tone: technical, terse, ship-oriented.
