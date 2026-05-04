@@ -134,8 +134,9 @@ async def handle_user_request(
     reply_ts: str | None,
     mode: str,
 ) -> None:
-    # Help short-circuit — deterministic, fast, no LLM call.
-    if is_help_text(text) and not files:
+    # Help short-circuit — deterministic, no LLM cost. Plane mode only:
+    # in chatbot mode the channel's persona should answer "help" in-character.
+    if mode == "plane" and is_help_text(text) and not files:
         await client.chat_postMessage(channel=channel, thread_ts=reply_ts, text=help_text_for(mode))
         return
 
@@ -221,7 +222,7 @@ async def slash_lazy(command, respond, client):
     text = await resolve_slack_mentions(client, text)
     email = await resolve_user_email(client, command["user_id"])
 
-    if is_help_text(text):
+    if mode == "plane" and is_help_text(text):
         await respond(text=help_text_for(mode), response_type="ephemeral")
         return
 
