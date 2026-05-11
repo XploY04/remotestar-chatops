@@ -6,7 +6,7 @@ import re
 
 from app.config import PLANE_HOST, settings
 from app.instructions import get_instructions
-from app.plane import plane_members_cache
+from app.plane import plane_members_cache, plane_states_cache
 
 
 HELP_TEXT_PLANE = """*RemoteStar ChatOps* — what I can do here:
@@ -116,6 +116,48 @@ def _build_plane_prompt(channel_id: str | None) -> str:
             "If you need to assign someone, call `plane__get_workspace_members` first to get their Plane user_id (UUID).\n"
         )
 
+    # Per-project states block, sorted by group order so the LLM can pick fluently.
+    GROUP_ORDER = ["backlog", "unstarted", "started", "completed", "cancelled"]
+    states_block = ""
+    if plane_states_cache:
+        project_to_states: dict[str, list[dict]] = {}
+        for sid, info in plane_states_cache.items():
+            project_to_states.setdefault(info.get("project_id") or "", []).append({
+                "id": sid,
+                "name": info.get("name") or "",
+                "group": (info.get("group") or "").lower(),
+            })
+        for project_id in project_to_states:
+            project_to_states[project_id].sort(
+                key=lambda s: (
+                    GROUP_ORDER.index(s["group"]) if s["group"] in GROUP_ORDER else 99,
+                    s["name"].lower(),
+                )
+            )
+
+        sections = []
+        project_label = {
+            settings.plane_project_candidate: "CANDIDATE",
+            settings.plane_project_recruiter: "RECRUITER",
+        }
+        for project_id, label in project_label.items():
+            states = project_to_states.get(project_id) or []
+            if not states:
+                continue
+            lines = [f"### {label}"]
+            for s in states:
+                lines.append(f"- {s['name']} ({s['group']}) → `{s['id']}`")
+            sections.append("\n".join(lines))
+
+        states_block = (
+            "\n## Plane states (per project) — for `plane__update_work_item`\n"
+            "The `state` field expects a state **UUID**, NEVER the name. Look it up here. "
+            "If the user names a state that's not in this list (e.g. 'Dev', 'QA'), DO NOT make one up — "
+            "tell them the state doesn't exist in that project and list the valid options.\n\n"
+            + "\n\n".join(sections)
+            + "\n"
+        )
+
     return f"""You are RemoteStar's ChatOps assistant in Slack. You help the team manage Plane tickets through natural language.
 
 ## Workspace context
@@ -130,7 +172,12 @@ def _build_plane_prompt(channel_id: str | None) -> str:
 - recruiter, recruiters, hiring, ATS, scraper, talent, dashboard → RECRUITER
 - If the user explicitly says a project, use it without confirming
 - If genuinely ambiguous, ask "CANDIDATE or RECRUITER?"
-{members_block}
+{members_block}{states_block}
+## Setting state and labels on update_work_item
+- `state` → must be a state UUID from the per-project list above, not a name. If the user says "set to Done in CANDIDATE", look up Done's UUID under CANDIDATE and pass that.
+- `labels` → must be a list of label UUIDs, not label names. We don't have a labels lookup table cached. If the user asks to add/remove labels by name, call `plane__list_labels` with the project_id first to get the UUIDs, then pass those.
+- If you can't find a matching state/label, tell the user what valid options exist; do NOT fabricate a UUID.
+
 ## Assigning tickets
 - The user's message may contain emails (e.g., `rudy@remotestar.io`) — these come from Slack `@mentions` already resolved to emails.
 - For `plane__create_work_item` and update tools, the `assignees` field expects a list of Plane user_id UUIDs. Look up the email in the workspace members map above to find the UUID.
@@ -141,7 +188,7 @@ def _build_plane_prompt(channel_id: str | None) -> str:
 Our API key has a hard limitation: ANY filter parameter on `plane__list_work_items` (assignee_ids, state_ids, state_groups, priorities, label_ids, type_ids, cycle_ids, module_ids, created_by_ids, query, workspace_search, etc.) routes through Plane's `/work-items/advanced-search/` endpoint which returns HTTP 403 for our key. Do NOT pass any of those filters — the call will always fail.
 
 What works:
-- **`plane__list_work_items` with ONLY `project_id`** (no other filters) — returns all issues in that project. Use pagination (`per_page`, `cursor`) for large projects.
+- **`plane__list_work_items` with ONLY `project_id`** (no other filters) — returns all issues in that project. Use pagination (`per_page`, `cursor`) for large projects. **ALWAYS pass `fields="id,name,sequence_id,state,assignees"`** — without it the response includes full `description_html` for every issue and a few hundred issues will blow past the LLM context window. The `name` field is required by the MCP's schema; the others keep the payload small.
 - **`plane__search_work_items` with a `query`** — free-text workspace-wide search across name and description. Use this when the user gives a topic like "find tickets about login bug".
 - **`plane__retrieve_work_item_by_identifier`** with `project_identifier` (RECRUITER or CANDIDATE) and `issue_identifier` (the integer sequence number) — for "show me RECRUITER-106" lookups.
 
