@@ -14,15 +14,18 @@ Mode is implied by the parent directory. Filename is the Slack channel ID with
 a `.md` extension; the file's contents are appended verbatim to the system
 prompt as that channel's custom context.
 
-There are no defaults. If a channel has no file under either directory, the
-bot will not respond there. If `dm.md` is missing under both, DMs are ignored.
+Default behavior is strict opt-in: a channel without a file gets no response.
+Setting DEFAULT_CHANNEL_MODE=chatbot (or plane) in the env switches on a
+fallback so any channel the bot is invited to gets handled with that mode
+when no specific file is present. Per-channel files always win over the
+fallback.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from app.config import logger
+from app.config import logger, settings
 
 
 # Repo root → /instructions  (this module lives at /app/instructions.py)
@@ -36,14 +39,31 @@ _cache: dict[str, tuple[str, str]] = {}
 # Resolved DM mode: "plane" / "chatbot" / None
 _dm_mode: str | None = None
 _dm_body: str = ""
+# Optional fallback for channels (and DMs) with no specific file. Read from
+# settings.default_channel_mode at load time and validated against the two
+# legal mode strings.
+_default_mode: str | None = None
 
 
 def load_instructions() -> None:
     """Walk the instructions directory and populate the cache."""
-    global _dm_mode, _dm_body
+    global _dm_mode, _dm_body, _default_mode
     _cache.clear()
     _dm_mode = None
     _dm_body = ""
+    _default_mode = None
+
+    # Optional fallback mode. Invalid values are dropped with a warning so a
+    # typo in .env doesn't silently open the bot to every channel in a mode
+    # the codebase doesn't know about.
+    configured = (settings.default_channel_mode or "").strip().lower() or None
+    if configured in ("plane", "chatbot"):
+        _default_mode = configured
+    elif configured:
+        logger.warning(
+            "DEFAULT_CHANNEL_MODE=%r is not 'plane' or 'chatbot'; ignoring",
+            settings.default_channel_mode,
+        )
 
     if not INSTRUCTIONS_DIR.exists():
         logger.warning("instructions/ directory not found at %s — bot will ignore every channel", INSTRUCTIONS_DIR)
@@ -83,8 +103,10 @@ def load_instructions() -> None:
 
     summary = ", ".join(f"{cid}={mode}" for cid, (mode, _) in _cache.items()) or "(none)"
     logger.info(
-        "Loaded %d channel instruction file(s): %s. DM mode: %s",
-        len(_cache), summary, _dm_mode or "ignored",
+        "Loaded %d channel instruction file(s): %s. DM mode: %s. Default fallback: %s",
+        len(_cache), summary,
+        _dm_mode or "ignored",
+        _default_mode or "off",
     )
 
 
@@ -95,18 +117,28 @@ def reload_instructions() -> None:
 
 def resolve_mode(channel_id: str | None) -> str | None:
     """Return 'plane' / 'chatbot' / None for a Slack channel ID. None means
-    the bot should ignore this channel entirely."""
+    the bot should ignore this channel entirely.
+
+    Resolution order:
+      1. DM (channel id starts with 'D'): use the dm.md mode if set.
+      2. Channel with a specific instructions file: use that file's mode.
+      3. Otherwise: the DEFAULT_CHANNEL_MODE fallback (if configured), else
+         None to keep strict opt-in semantics.
+    """
     if not channel_id:
         return None
     if channel_id.startswith("D"):
-        return _dm_mode
+        return _dm_mode or _default_mode
     entry = _cache.get(channel_id)
-    return entry[0] if entry else None
+    if entry:
+        return entry[0]
+    return _default_mode
 
 
 def get_instructions(channel_id: str | None) -> str:
     """Return the channel's instruction body (markdown text). Empty string if
-    the channel has no file."""
+    the channel has no file. The fallback mode does not inject any channel
+    body — callers will get the bare mode prompt."""
     if not channel_id:
         return ""
     if channel_id.startswith("D"):

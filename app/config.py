@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     port: int = 9001
     log_level: str = "INFO"
 
+    # Default mode for channels (and DMs) that don't have a specific
+    # instructions file. "plane" or "chatbot" turns on the fallback so the
+    # bot responds in any channel it's invited to. Unset (default) keeps
+    # the original strict opt-in behavior.
+    default_channel_mode: str | None = None
+
     # Daily standup cron: hour (UTC) at which to DM each member their pending tickets.
     # 0..23 enables, -1 disables.
     standup_hour_utc: int = -1

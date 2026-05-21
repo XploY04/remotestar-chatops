@@ -178,7 +178,7 @@ The bot runs in one of two modes per channel:
 - **plane**: full Plane MCP toolset, attachment uploads, reaction-driven status. For engineering teams using Plane.
 - **chatbot**: no tools, no attachments, no reactions. A general-purpose assistant with channel-specific context. For teams that don't use Plane (marketing, BD, sales, tech-discussion, etc.).
 
-There is no default mode. The bot only responds in channels that have an instructions file:
+The bot only responds in channels it knows about. Two ways to make it know about a channel:
 
 ```
 instructions/
@@ -190,13 +190,15 @@ instructions/
     └── dm.md               # if present, DMs run in chatbot mode
 ```
 
-- Filename = the Slack channel ID with `.md` extension (e.g. `C0B0E9R0PE0.md`). The file's contents are appended verbatim to the system prompt as that channel's custom context.
-- Mode comes from the parent directory.
-- `dm.md` is a special filename. Whichever subdirectory it sits in defines DM behavior. If both `plane/dm.md` and `chatbot/dm.md` exist, the bot logs a warning and uses `plane/dm.md`. If neither exists, DMs are silently ignored.
-- A channel without a file gets no response from the bot. Silent, no fallback. The bot logs `Mention in unconfigured channel C... — ignoring` so you can see who tried.
-- The same channel ID under both `plane/` and `chatbot/` is rejected at load with a warning; one wins, the other is dropped.
+1. **Per-channel file (highest priority).** Drop a markdown file under `instructions/plane/` or `instructions/chatbot/`. Filename is the Slack channel ID with `.md` extension (e.g. `C0B0E9R0PE0.md`). The file's contents are appended verbatim to the system prompt as that channel's custom context. Mode comes from the parent directory.
+2. **`DEFAULT_CHANNEL_MODE` env var (fallback).** Set it to `chatbot` (or `plane`) in `.env` and the bot uses that mode for any channel it's invited to that doesn't have a specific file. Per-channel files still win.
+3. **Neither set.** The bot stays silent. It logs `Mention in unconfigured channel C... — ignoring` so you can see who tried.
 
-After editing the directory: `systemctl restart chatops`. Hot reload is a future enhancement; for now the bot reads `instructions/` once at startup.
+`dm.md` is a special filename. Whichever subdirectory it sits in defines DM behavior. If both `plane/dm.md` and `chatbot/dm.md` exist, the bot logs a warning and uses `plane/dm.md`. If neither exists, DMs fall through to `DEFAULT_CHANNEL_MODE` (if set), otherwise are silently ignored.
+
+The same channel ID under both `plane/` and `chatbot/` is rejected at load with a warning; one wins, the other is dropped.
+
+After editing the directory or `.env`: `systemctl restart chatops`. Hot reload is a future enhancement; for now the bot reads `instructions/` and `settings.default_channel_mode` once at startup.
 
 To find a channel's ID, right-click it in Slack → **Copy link**. The ID is the last segment of the URL.
 
