@@ -11,7 +11,7 @@ from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
 
 from app import audit
 from app.config import logger, settings
-from app.instructions import load_instructions
+from app.instructions import load_instructions, refresh_all_canvases
 from app.plane import mcp, refresh_plane_members, refresh_plane_states
 from app.slack_app import slack_app
 from app.standup import standup_loop
@@ -20,10 +20,8 @@ from app.standup import standup_loop
 # Keep this import for its side effects.
 from app import handlers  # noqa: F401
 
-
 api = FastAPI()
 slack_handler = AsyncSlackRequestHandler(slack_app)
-
 _background_tasks: list[asyncio.Task] = []
 
 
@@ -52,6 +50,13 @@ async def on_startup() -> None:
     await refresh_plane_members()
     await refresh_plane_states()
     load_instructions()
+
+    # Load canvas content for all mapped channels at startup
+    try:
+        await refresh_all_canvases(settings.slack_bot_token)
+        logger.info("Canvas content loaded at startup")
+    except Exception as e:
+        logger.warning("Canvas load at startup failed: %s", e)
 
     if 0 <= settings.standup_hour_utc <= 23:
         _background_tasks.append(asyncio.create_task(standup_loop()))
