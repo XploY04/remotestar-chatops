@@ -1,0 +1,47 @@
+name: Deploy to prod
+
+on:
+  push:
+    branches: [prod]
+  workflow_dispatch:
+
+# Don't fire two deploys at once; queue them so a later push fully supersedes
+# the previous run instead of racing it.
+concurrency:
+  group: chatops-prod-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: SSH + restart + health
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Prepare SSH key
+        run: |
+          install -m 700 -d ~/.ssh
+          # The deploy key is forced to /root/chatops-deploy.sh on the server
+          # side (see /root/.ssh/authorized_keys, `command="..."` directive),
+          # so the script invocation below is decorative; sshd ignores it and
+          # runs the forced command regardless.
+          umask 077
+          printf '%s\n' "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/id_deploy
+          # Pin the host key to avoid a TOFU prompt and to fail closed if the
+          # remote identity changes.
+          ssh-keyscan -p ${{ secrets.SSH_PORT }} -t ed25519 ${{ secrets.SSH_HOST }} > ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Run deploy script over SSH
+        run: |
+          ssh -i ~/.ssh/id_deploy \
+              -p ${{ secrets.SSH_PORT }} \
+              -o BatchMode=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o StrictHostKeyChecking=yes \
+              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+              deploy
+
+      - name: Shred local key
+        if: always()
+        run: |
+          shred -u ~/.ssh/id_deploy 2>/dev/null || rm -f ~/.ssh/id_deploy

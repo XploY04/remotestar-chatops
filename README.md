@@ -272,6 +272,80 @@ Every tool call is logged to MongoDB collection `chatops_audit` with:
 
 Best-effort: write failures are logged and swallowed; the bot does not surface them to the user. If `MONGODB_URI` is unset or the ping at startup fails, audit logging is disabled and the bot keeps running.
 
+## Deploy (CI/CD)
+
+Production deploys are gated on the `prod` branch. Pushes to `main` don't deploy.
+
+```
+feature  →  main   (merge work here, no deploy)
+main     →  prod   (merge or fast-forward to release)
+prod                → GitHub Actions
+                    → SSH to rs (forced command)
+                    → git pull + restart chatops + curl /health
+```
+
+### Release flow
+
+```bash
+# Active work lands on main via PRs as usual.
+# When you want to ship, fast-forward prod to main:
+git fetch origin
+git checkout prod
+git merge --ff-only origin/main
+git push origin prod
+```
+
+The GitHub Actions workflow at `.github/workflows/deploy.yml` triggers on push to `prod`, SSHes to the rs server with a dedicated deploy key, and runs `/root/chatops-deploy.sh`. That script:
+
+1. Fetches and fast-forwards `prod` on disk.
+2. Reinstalls Python deps only when `requirements.txt` changed in the pulled commits.
+3. Restarts `chatops.service`.
+4. Polls `http://localhost:9001/health` for up to 30 seconds; fails the workflow with the last 40 journal lines on timeout.
+
+Concurrency on the workflow is set to a single in-flight deploy at a time. Subsequent pushes queue.
+
+### Secrets
+
+GitHub repository secrets used by the workflow:
+
+| Secret | Value |
+|---|---|
+| `SSH_HOST` | `plane.remotestar.io` |
+| `SSH_PORT` | `2424` |
+| `SSH_USER` | `root` |
+| `SSH_DEPLOY_KEY` | Private key (ed25519). Public side lives in `/root/.ssh/authorized_keys` on rs, locked to `command="/root/chatops-deploy.sh",restrict`. |
+
+The `restrict` directive on the server-side authorized_keys entry disables port forwarding, agent forwarding, X11, and pty for the deploy key. The forced `command="..."` means even if the private key is exfiltrated, the only thing the holder can do is run the deploy script. They cannot get a shell, cannot read `.env`, cannot run other commands.
+
+### Rotating the deploy key
+
+```bash
+# 1. Generate a fresh keypair locally
+ssh-keygen -t ed25519 -N "" -f /tmp/new_deploy -C "chatops-ci-deploy@github-actions"
+
+# 2. Replace the existing line in /root/.ssh/authorized_keys on rs:
+#    The line that starts with command="/root/chatops-deploy.sh",restrict
+#    Replace its public-key portion with the contents of /tmp/new_deploy.pub.
+
+# 3. Update the GitHub secret:
+gh secret set SSH_DEPLOY_KEY --repo XploY04/remotestar-chatops < /tmp/new_deploy
+
+# 4. Shred local artifacts:
+shred -u /tmp/new_deploy /tmp/new_deploy.pub
+```
+
+Trigger a workflow run from the Actions tab (`Run workflow` on `prod`) to confirm the new key works before considering the rotation done.
+
+### Manual deploy
+
+If GitHub Actions is unavailable, you can deploy by hand. From your laptop (using your personal SSH key, not the deploy key):
+
+```bash
+ssh rs /root/chatops-deploy.sh
+```
+
+Same script the workflow runs. Fails the same way on a bad commit.
+
 ## Adding a new service (e.g. GitHub)
 
 1. Get a GitHub PAT or set up a GitHub App.
