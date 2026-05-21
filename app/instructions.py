@@ -19,10 +19,16 @@ Setting DEFAULT_CHANNEL_MODE=chatbot (or plane) in the env switches on a
 fallback so any channel the bot is invited to gets handled with that mode
 when no specific file is present. Per-channel files always win over the
 fallback.
+
+Canvas integration:
+    Certain channels can be linked to a Slack canvas. The canvas content is
+    fetched at startup and refreshed in real-time when a canvas_updated event
+    is received. Canvas content is appended to the channel's instruction body.
 """
 
 from __future__ import annotations
 
+import aiohttp
 from pathlib import Path
 
 from app.config import logger, settings
@@ -44,6 +50,101 @@ _dm_body: str = ""
 # legal mode strings.
 _default_mode: str | None = None
 
+# ---------------------------------------------------------------------------
+# Canvas integration
+# ---------------------------------------------------------------------------
+
+# Maps channel_id -> (canvas_id, cached_content)
+# Add entries here for each channel that has a linked canvas.
+_canvas_cache: dict[str, tuple[str, str]] = {
+    "C0846QDN39D": ("F0B2DDMBKGB", ""),  # BD channel -> BD Messaging Library canvas
+}
+
+
+async def fetch_canvas_content(canvas_id: str, bot_token: str) -> str:
+    """Fetch canvas content from Slack API and return as plain text."""
+    url = "https://slack.com/api/canvases.sections.lookup"
+    headers = {
+        "Authorization": f"Bearer {bot_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "canvas_id": canvas_id,
+        "criteria": {
+            "section_types": [
+                "any_header",
+                "bulleted_list",
+                "numbered_list",
+                "paragraph",
+                "table",
+                "code",
+            ]
+        },
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                data = await resp.json()
+                if not data.get("ok"):
+                    logger.warning(
+                        "Canvas fetch failed for %s: %s", canvas_id, data.get("error")
+                    )
+                    return ""
+                sections = data.get("sections", [])
+                content = "\n\n".join(
+                    s.get("content", {}).get("markdown", "")
+                    for s in sections
+                    if s.get("content", {}).get("markdown", "").strip()
+                )
+                return content.strip()
+    except Exception as e:
+        logger.warning("Canvas fetch exception for %s: %s", canvas_id, e, exc_info=True)
+        return ""
+
+
+async def refresh_canvas(channel_id: str, bot_token: str) -> None:
+    """Re-fetch canvas content for a channel and update the in-memory cache."""
+    if channel_id not in _canvas_cache:
+        return
+    canvas_id, _ = _canvas_cache[channel_id]
+    content = await fetch_canvas_content(canvas_id, bot_token)
+    if content:
+        _canvas_cache[channel_id] = (canvas_id, content)
+        logger.info(
+            "Canvas refreshed for channel %s (canvas_id=%s, %d chars)",
+            channel_id, canvas_id, len(content),
+        )
+    else:
+        logger.warning(
+            "Canvas content empty or fetch failed for channel %s (canvas_id=%s)",
+            channel_id, canvas_id,
+        )
+
+
+async def refresh_all_canvases(bot_token: str) -> None:
+    """Fetch all mapped canvases at startup."""
+    for channel_id in list(_canvas_cache.keys()):
+        await refresh_canvas(channel_id, bot_token)
+
+
+def get_canvas_content(channel_id: str) -> str:
+    """Return the cached canvas content for a channel. Empty string if none."""
+    entry = _canvas_cache.get(channel_id)
+    return entry[1] if entry else ""
+
+
+def get_channel_id_for_canvas(canvas_id: str) -> str | None:
+    """Return the channel_id mapped to a given canvas_id, or None."""
+    for channel_id, (cid, _) in _canvas_cache.items():
+        if cid == canvas_id:
+            return channel_id
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Instructions loader
+# ---------------------------------------------------------------------------
+
 
 def load_instructions() -> None:
     """Walk the instructions directory and populate the cache."""
@@ -53,9 +154,6 @@ def load_instructions() -> None:
     _dm_body = ""
     _default_mode = None
 
-    # Optional fallback mode. Invalid values are dropped with a warning so a
-    # typo in .env doesn't silently open the bot to every channel in a mode
-    # the codebase doesn't know about.
     configured = (settings.default_channel_mode or "").strip().lower() or None
     if configured in ("plane", "chatbot"):
         _default_mode = configured
@@ -66,7 +164,10 @@ def load_instructions() -> None:
         )
 
     if not INSTRUCTIONS_DIR.exists():
-        logger.warning("instructions/ directory not found at %s — bot will ignore every channel", INSTRUCTIONS_DIR)
+        logger.warning(
+            "instructions/ directory not found at %s — bot will ignore every channel",
+            INSTRUCTIONS_DIR,
+        )
         return
 
     plane_dm = PLANE_DIR / "dm.md"
@@ -80,10 +181,9 @@ def load_instructions() -> None:
                 continue
             stem = md_file.stem
             if stem == "dm":
-                continue  # handled below
+                continue
             body = md_file.read_text(encoding="utf-8").strip()
             if stem in _cache:
-                # Same channel ID configured in both modes — refuse to guess.
                 logger.warning(
                     "Channel %s has files in both plane/ and chatbot/; ignoring %s",
                     stem, md_file,
@@ -91,9 +191,10 @@ def load_instructions() -> None:
                 continue
             _cache[stem] = (mode, body)
 
-    # DM resolution: prefer plane/dm.md if both exist.
     if plane_dm.exists() and chatbot_dm.exists():
-        logger.warning("Both instructions/plane/dm.md and instructions/chatbot/dm.md exist; using plane/")
+        logger.warning(
+            "Both instructions/plane/dm.md and instructions/chatbot/dm.md exist; using plane/"
+        )
     if plane_dm.exists():
         _dm_mode = "plane"
         _dm_body = plane_dm.read_text(encoding="utf-8").strip()
@@ -101,10 +202,13 @@ def load_instructions() -> None:
         _dm_mode = "chatbot"
         _dm_body = chatbot_dm.read_text(encoding="utf-8").strip()
 
-    summary = ", ".join(f"{cid}={mode}" for cid, (mode, _) in _cache.items()) or "(none)"
+    summary = (
+        ", ".join(f"{cid}={mode}" for cid, (mode, _) in _cache.items()) or "(none)"
+    )
     logger.info(
         "Loaded %d channel instruction file(s): %s. DM mode: %s. Default fallback: %s",
-        len(_cache), summary,
+        len(_cache),
+        summary,
         _dm_mode or "ignored",
         _default_mode or "off",
     )
@@ -116,15 +220,7 @@ def reload_instructions() -> None:
 
 
 def resolve_mode(channel_id: str | None) -> str | None:
-    """Return 'plane' / 'chatbot' / None for a Slack channel ID. None means
-    the bot should ignore this channel entirely.
-
-    Resolution order:
-      1. DM (channel id starts with 'D'): use the dm.md mode if set.
-      2. Channel with a specific instructions file: use that file's mode.
-      3. Otherwise: the DEFAULT_CHANNEL_MODE fallback (if configured), else
-         None to keep strict opt-in semantics.
-    """
+    """Return 'plane' / 'chatbot' / None for a Slack channel ID."""
     if not channel_id:
         return None
     if channel_id.startswith("D"):
@@ -136,12 +232,25 @@ def resolve_mode(channel_id: str | None) -> str | None:
 
 
 def get_instructions(channel_id: str | None) -> str:
-    """Return the channel's instruction body (markdown text). Empty string if
-    the channel has no file. The fallback mode does not inject any channel
-    body — callers will get the bare mode prompt."""
+    """Return the channel's instruction body (markdown text).
+    Combines .md file content + live canvas content if available."""
     if not channel_id:
         return ""
+
+    # Get .md file content
     if channel_id.startswith("D"):
-        return _dm_body
-    entry = _cache.get(channel_id)
-    return entry[1] if entry else ""
+        md_content = _dm_body
+    else:
+        entry = _cache.get(channel_id)
+        md_content = entry[1] if entry else ""
+
+    # Append live canvas content if available
+    canvas_content = get_canvas_content(channel_id)
+    if canvas_content:
+        return (
+            f"{md_content}\n\n"
+            f"## Live Canvas Content (auto-synced from Slack)\n"
+            f"{canvas_content}"
+        ).strip()
+
+    return md_content
