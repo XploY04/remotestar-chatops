@@ -21,9 +21,9 @@ when no specific file is present. Per-channel files always win over the
 fallback.
 
 Canvas integration:
-    Certain channels can be linked to a Slack canvas. The canvas content is
-    fetched at startup and refreshed in real-time when a canvas_updated event
-    is received. Canvas content is appended to the channel's instruction body.
+    Certain channels can be linked to one or more Slack canvases. Canvas
+    content is fetched at startup and refreshed every 12 hours via polling.
+    Canvas content is appended to the channel's instruction body.
 """
 
 from __future__ import annotations
@@ -45,21 +45,26 @@ _cache: dict[str, tuple[str, str]] = {}
 # Resolved DM mode: "plane" / "chatbot" / None
 _dm_mode: str | None = None
 _dm_body: str = ""
-# Optional fallback for channels (and DMs) with no specific file. Read from
-# settings.default_channel_mode at load time and validated against the two
-# legal mode strings.
+# Optional fallback for channels (and DMs) with no specific file.
 _default_mode: str | None = None
 
 # ---------------------------------------------------------------------------
 # Canvas integration
 # ---------------------------------------------------------------------------
 
-# Maps channel_id -> (canvas_id, cached_content)
-# Add entries here for each channel that has a linked canvas.
-_canvas_cache: dict[str, tuple[str, str]] = {
-    "C0846QDN39D": ("F0B2DDMBKGB", ""),  # BD channel -> BD Messaging Library canvas
-    "C09LJEUACG0": ("F0B2WQBFBJA", ""),  # Marketing channel -> Marketing canvas
-}
+# Maps channel_id -> list of (canvas_id, cached_content)
+# Each channel can have multiple canvases.
+# To add a new channel: add a new key with its canvas ID(s).
+# To add a new canvas to an existing channel: append to its list.
+_canvas_cache: dict[str, list[tuple[str, str]]] = {
+    "C0846QDN39D": [
+        ("F0B2DDMBKGB", ""),   # BD Messaging Library canvas
+    ],
+    "C09LJEUACG0": [
+        ("F0B2WQBFBJA", ""),   # Marketing canvas 1
+        ("F0AM8THAM2A", ""),   # Marketing canvas 2
+        ("F0APDRL8C8H", ""),   # Marketing canvas 3
+    ],
 }
 
 
@@ -105,41 +110,50 @@ async def fetch_canvas_content(canvas_id: str, bot_token: str) -> str:
 
 
 async def refresh_canvas(channel_id: str, bot_token: str) -> None:
-    """Re-fetch canvas content for a channel and update the in-memory cache."""
+    """Re-fetch all canvas content for a channel and update the in-memory cache."""
     if channel_id not in _canvas_cache:
         return
-    canvas_id, _ = _canvas_cache[channel_id]
-    content = await fetch_canvas_content(canvas_id, bot_token)
-    if content:
-        _canvas_cache[channel_id] = (canvas_id, content)
-        logger.info(
-            "Canvas refreshed for channel %s (canvas_id=%s, %d chars)",
-            channel_id, canvas_id, len(content),
-        )
-    else:
-        logger.warning(
-            "Canvas content empty or fetch failed for channel %s (canvas_id=%s)",
-            channel_id, canvas_id,
-        )
+    canvases = _canvas_cache[channel_id]
+    updated = []
+    for canvas_id, old_content in canvases:
+        content = await fetch_canvas_content(canvas_id, bot_token)
+        if content:
+            updated.append((canvas_id, content))
+            logger.info(
+                "Canvas refreshed for channel %s (canvas_id=%s, %d chars)",
+                channel_id, canvas_id, len(content),
+            )
+        else:
+            # Keep old content if fetch failed
+            updated.append((canvas_id, old_content))
+            logger.warning(
+                "Canvas fetch failed for channel %s (canvas_id=%s) — keeping old content",
+                channel_id, canvas_id,
+            )
+    _canvas_cache[channel_id] = updated
 
 
 async def refresh_all_canvases(bot_token: str) -> None:
-    """Fetch all mapped canvases at startup."""
+    """Fetch all mapped canvases at startup or on poll cycle."""
     for channel_id in list(_canvas_cache.keys()):
         await refresh_canvas(channel_id, bot_token)
 
 
 def get_canvas_content(channel_id: str) -> str:
-    """Return the cached canvas content for a channel. Empty string if none."""
-    entry = _canvas_cache.get(channel_id)
-    return entry[1] if entry else ""
+    """Return all cached canvas content for a channel combined. Empty string if none."""
+    canvases = _canvas_cache.get(channel_id)
+    if not canvases:
+        return ""
+    parts = [content for _, content in canvases if content.strip()]
+    return "\n\n---\n\n".join(parts)
 
 
 def get_channel_id_for_canvas(canvas_id: str) -> str | None:
     """Return the channel_id mapped to a given canvas_id, or None."""
-    for channel_id, (cid, _) in _canvas_cache.items():
-        if cid == canvas_id:
-            return channel_id
+    for channel_id, canvases in _canvas_cache.items():
+        for cid, _ in canvases:
+            if cid == canvas_id:
+                return channel_id
     return None
 
 
@@ -217,7 +231,7 @@ def load_instructions() -> None:
 
 
 def reload_instructions() -> None:
-    """Re-scan disk. Wire to a slash command or admin endpoint if hot-reload is needed."""
+    """Re-scan disk."""
     load_instructions()
 
 
