@@ -58,6 +58,8 @@ _default_mode: str | None = None
 # Add entries here for each channel that has a linked canvas.
 _canvas_cache: dict[str, tuple[str, str]] = {
     "C0846QDN39D": ("F0B2DDMBKGB", ""),  # BD channel -> BD Messaging Library canvas
+    "C09LJEUACG0": ("F0B2WQBFBJA", ""),  # Marketing channel -> Marketing canvas
+}
 }
 
 
