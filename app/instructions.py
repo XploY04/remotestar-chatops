@@ -65,6 +65,13 @@ _canvas_cache: dict[str, list[tuple[str, str]]] = {
         ("F0AM8THAM2A", ""),   # Marketing canvas 2
         ("F0APDRL8C8H", ""),   # Marketing canvas 3
     ],
+    "C02MH67ENV8": [
+        ("F05UJRK9BAS", ""),   # Internal team canvas 1
+        ("F06PL5X1FLJ", ""),   # Internal team canvas 2
+        ("F09K18T8LQ5", ""),   # Internal team canvas 3
+        ("F0AFN7A34L8", ""),   # Internal team canvas 4
+        ("F09JFD22UKW", ""),   # Internal team canvas 5
+    ],
 }
 
 
