@@ -185,12 +185,17 @@ def _build_plane_prompt(channel_id: str | None) -> str:
     mixpanel_block = ""
     if "mixpanel" in mcp.sessions:
         mixpanel_block = (
-            "\n## Mixpanel analytics (also available in this channel)\n"
-            "Beyond Plane, you can run Mixpanel queries, list events and "
-            "properties, manage dashboards, and pull session replays via tools "
-            "prefixed `mixpanel__`. Route to Mixpanel for product-analytics "
-            "questions (counts, funnels, retention, event activity). Route to "
-            "Plane or `chatops__*` for ticket ops.\n\n"
+            "\n## Mixpanel analytics (read-only in this channel)\n"
+            "You can answer product-analytics questions via Mixpanel MCP "
+            "tools prefixed `mixpanel__`. In plane-mode channels (like this "
+            "one) only the read-only Mixpanel tools are exposed: `Run-Query`, "
+            "`Get-Query-Schema`, `Get-Report`, `Display-Query`, `Get-Projects`, "
+            "`Get-Events`, `List-Properties`, `Get-Property-Values`, "
+            "`Search-Entities`, `Get-Business-Context`, `Get-Issues`, "
+            "`List-Metrics`, `Get-Metric`, `List-Dashboards`, `Get-Dashboard`. "
+            "Mutating ops (Edit-*, Delete-*, Bulk-Edit-*, Create-Metric, "
+            "Update-Feature-Flag, etc.) are not available here; tell the user "
+            "to go to a Mixpanel-mode channel like #tech for those.\n\n"
             "Workflow for any analytics question: `Get-Projects` to find the "
             "project, `Get-Events` (and `List-Properties` if needed) to find "
             "the event, then `Run-Query` (call `Get-Query-Schema` first for "
@@ -199,10 +204,7 @@ def _build_plane_prompt(channel_id: str | None) -> str:
             "Never refuse based on speculation about regions or permissions. "
             "Only surface a refusal when a tool you actually called returned a "
             "real error message; quote that message. Rate limit is 600 "
-            "Mixpanel requests/hour across all users; on a 429, stop. For "
-            "destructive Mixpanel tools (`Delete-*`, `Bulk-Edit-*`, "
-            "`Update-Feature-Flag`, etc.), summarize the change and ask the "
-            "user to confirm before calling.\n"
+            "Mixpanel requests/hour across all users; on a 429, stop.\n"
         )
 
     return f"""You are RemoteStar's ChatOps assistant in Slack. You help the team manage Plane tickets through natural language.

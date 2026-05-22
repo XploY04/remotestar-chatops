@@ -1,8 +1,8 @@
 """LLM tool-calling loop. Mode-aware:
-- "plane":    Plane MCP toolset + chatops__* local tools, multi-turn loop.
-- "mixpanel": Mixpanel MCP toolset only, multi-turn loop. No Plane tools so
-              an analytics channel can't accidentally create tickets, and
-              vice versa.
+- "plane":    Plane MCP toolset + chatops__* local tools + a curated read-only
+              subset of Mixpanel tools (so plane channels can answer analytics
+              questions without exceeding OpenAI's 128-tool array limit).
+- "mixpanel": full Mixpanel MCP toolset (45 tools), no Plane.
 - "chatbot":  no tools, single completion call.
 """
 
@@ -20,6 +20,36 @@ from app.prompts import build_system_prompt
 
 
 openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+
+# OpenAI chat completions caps the `tools` array at 128. Plane MCP exposes
+# 109 tools, the local LOCAL_TOOL_DEFS adds 1; that leaves 18 slots for
+# Mixpanel tools in plane mode. We pick a read-only analytics subset, since
+# mutating Mixpanel ops (Edit-Event, Delete-Dashboard, Bulk-Edit-*, etc.)
+# are out of place in a Plane ticketing channel; they remain available in
+# mixpanel-mode channels where the full 45-tool set is exposed.
+OPENAI_TOOLS_MAX = 128
+PLANE_MODE_MIXPANEL_SUBSET = frozenset({
+    # Analytics
+    "mixpanel__Run-Query",
+    "mixpanel__Get-Query-Schema",
+    "mixpanel__Get-Report",
+    "mixpanel__Display-Query",
+    # Data discovery
+    "mixpanel__Get-Projects",
+    "mixpanel__Get-Events",
+    "mixpanel__List-Properties",
+    "mixpanel__Get-Property-Values",
+    "mixpanel__Search-Entities",
+    "mixpanel__Get-Business-Context",
+    "mixpanel__Get-Issues",
+    # Metrics
+    "mixpanel__List-Metrics",
+    "mixpanel__Get-Metric",
+    # Dashboards (read)
+    "mixpanel__List-Dashboards",
+    "mixpanel__Get-Dashboard",
+})
 
 
 async def agent_loop(
@@ -59,14 +89,13 @@ async def agent_loop(
         return final, None
 
     # Tool-using modes:
-    #   mixpanel  → mixpanel tools only (kept tight so analytics-only channels
-    #               can't create tickets by mistake).
-    #   plane     → plane tools + Mixpanel tools (when the Mixpanel MCP is
-    #               connected). Plane channels are the engineering room where
-    #               having both ticket ops and ad-hoc analytics in one place
-    #               is the design goal. The Mixpanel union is self-gating:
-    #               when the MCP isn't running, openai_tools(server="mixpanel")
-    #               returns an empty list and plane behavior is unchanged.
+    #   mixpanel  → full Mixpanel toolset (45 tools). No Plane tools, so an
+    #               analytics-only channel can't create tickets by mistake.
+    #   plane     → all Plane MCP tools + local chatops__* tools + a curated
+    #               read-only subset of Mixpanel tools. The subset is required
+    #               because the union of all three (109 + 1 + 45 = 155) is past
+    #               OpenAI's 128-tool ceiling for chat completions. Mutating
+    #               Mixpanel ops are reserved for mixpanel-mode channels.
     if mode == "mixpanel":
         tools = mcp.openai_tools(server="mixpanel")
         no_tools_msg = (
@@ -74,12 +103,24 @@ async def agent_loop(
             "Try again in a moment, or ping someone to re-run OAuth bootstrap."
         )
     else:  # plane (and any future Plane-style modes)
-        tools = (
-            mcp.openai_tools(server="plane")
-            + mcp.openai_tools(server="mixpanel")
-            + LOCAL_TOOL_DEFS
-        )
+        plane_tools = mcp.openai_tools(server="plane")
+        mixpanel_tools = [
+            t for t in mcp.openai_tools(server="mixpanel")
+            if t["function"]["name"] in PLANE_MODE_MIXPANEL_SUBSET
+        ]
+        tools = plane_tools + mixpanel_tools + LOCAL_TOOL_DEFS
         no_tools_msg = "I'm not connected to any backends right now. Try again in a moment."
+
+    # Defensive: never exceed the OpenAI ceiling. If we somehow do (future
+    # tool additions, MCP version bump), log loudly and truncate rather than
+    # send a 400 to the user.
+    if len(tools) > OPENAI_TOOLS_MAX:
+        logger.error(
+            "Tools list exceeds OpenAI limit: have %d, max %d. Truncating. "
+            "Review PLANE_MODE_MIXPANEL_SUBSET / mode tool scoping.",
+            len(tools), OPENAI_TOOLS_MAX,
+        )
+        tools = tools[:OPENAI_TOOLS_MAX]
 
     if not tools:
         return no_tools_msg, None
