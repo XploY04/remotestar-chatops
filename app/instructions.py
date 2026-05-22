@@ -74,39 +74,26 @@ _canvas_cache: dict[str, list[tuple[str, str]]] = {
 
 
 async def fetch_canvas_content(canvas_id: str, bot_token: str) -> str:
-    """Fetch canvas content from Slack API and return as plain text."""
-    url = "https://slack.com/api/canvases.sections.lookup"
+    """Fetch canvas content from Slack API using files.info."""
+    url = "https://slack.com/api/files.info"
     headers = {
         "Authorization": f"Bearer {bot_token}",
-        "Content-Type": "application/json",
     }
-    payload = {
-        "canvas_id": canvas_id,
-        "criteria": {
-            "section_types": [
-                "any_header",
-                "bulleted_list",
-                "numbered_list",
-                "paragraph",
-                "table",
-                "code",
-            ]
-        },
-    }
+    params = {"file": canvas_id}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
+            async with session.get(url, headers=headers, params=params) as resp:
                 data = await resp.json()
                 if not data.get("ok"):
                     logger.warning(
                         "Canvas fetch failed for %s: %s", canvas_id, data.get("error")
                     )
                     return ""
-                sections = data.get("sections", [])
-                content = "\n\n".join(
-                    s.get("content", {}).get("markdown", "")
-                    for s in sections
-                    if s.get("content", {}).get("markdown", "").strip()
+                file_data = data.get("file", {})
+                content = (
+                    file_data.get("plain_text") or
+                    file_data.get("preview") or
+                    ""
                 )
                 return content.strip()
     except Exception as e:
@@ -125,14 +112,12 @@ async def refresh_canvas(channel_id: str, bot_token: str) -> None:
         content = await fetch_canvas_content(canvas_id, bot_token)
         if content:
             updated.append((canvas_id, content))
-            # Save to MongoDB for persistence across restarts
             await save_canvas_content(channel_id, canvas_id, content)
             logger.info(
                 "Canvas refreshed for channel %s (canvas_id=%s, %d chars)",
                 channel_id, canvas_id, len(content),
             )
         else:
-            # Keep old content if fetch failed
             updated.append((canvas_id, old_content))
             logger.warning(
                 "Canvas fetch failed for channel %s (canvas_id=%s) — keeping old content",
@@ -142,9 +127,7 @@ async def refresh_canvas(channel_id: str, bot_token: str) -> None:
 
 
 async def preload_canvas_from_db() -> None:
-    """At startup: load all canvas content from MongoDB into memory cache.
-    This means the bot has canvas knowledge instantly on restart
-    without waiting for the next Slack API fetch."""
+    """At startup: load all canvas content from MongoDB into memory cache."""
     from app.audit import load_all_canvas_content
     db_content = await load_all_canvas_content()
     for channel_id, canvases in _canvas_cache.items():
@@ -281,14 +264,12 @@ def get_instructions(channel_id: str | None) -> str:
     if not channel_id:
         return ""
 
-    # Get .md file content
     if channel_id.startswith("D"):
         md_content = _dm_body
     else:
         entry = _cache.get(channel_id)
         md_content = entry[1] if entry else ""
 
-    # Append live canvas content if available
     canvas_content = get_canvas_content(channel_id)
     if canvas_content:
         return (
