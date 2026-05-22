@@ -23,7 +23,7 @@ fallback.
 Canvas integration:
     Certain channels can be linked to one or more Slack canvases. Canvas
     content is fetched at startup and refreshed every 12 hours via polling.
-    Canvas content is appended to the channel's instruction body.
+    Content is persisted to MongoDB so it survives bot restarts instantly.
 """
 
 from __future__ import annotations
@@ -54,8 +54,6 @@ _default_mode: str | None = None
 
 # Maps channel_id -> list of (canvas_id, cached_content)
 # Each channel can have multiple canvases.
-# To add a new channel: add a new key with its canvas ID(s).
-# To add a new canvas to an existing channel: append to its list.
 _canvas_cache: dict[str, list[tuple[str, str]]] = {
     "C0846QDN39D": [
         ("F0B2DDMBKGB", ""),   # BD Messaging Library canvas
@@ -117,7 +115,8 @@ async def fetch_canvas_content(canvas_id: str, bot_token: str) -> str:
 
 
 async def refresh_canvas(channel_id: str, bot_token: str) -> None:
-    """Re-fetch all canvas content for a channel and update the in-memory cache."""
+    """Re-fetch all canvas content for a channel, update memory + MongoDB."""
+    from app.audit import save_canvas_content
     if channel_id not in _canvas_cache:
         return
     canvases = _canvas_cache[channel_id]
@@ -126,6 +125,8 @@ async def refresh_canvas(channel_id: str, bot_token: str) -> None:
         content = await fetch_canvas_content(canvas_id, bot_token)
         if content:
             updated.append((canvas_id, content))
+            # Save to MongoDB for persistence across restarts
+            await save_canvas_content(channel_id, canvas_id, content)
             logger.info(
                 "Canvas refreshed for channel %s (canvas_id=%s, %d chars)",
                 channel_id, canvas_id, len(content),
@@ -140,14 +141,34 @@ async def refresh_canvas(channel_id: str, bot_token: str) -> None:
     _canvas_cache[channel_id] = updated
 
 
+async def preload_canvas_from_db() -> None:
+    """At startup: load all canvas content from MongoDB into memory cache.
+    This means the bot has canvas knowledge instantly on restart
+    without waiting for the next Slack API fetch."""
+    from app.audit import load_all_canvas_content
+    db_content = await load_all_canvas_content()
+    for channel_id, canvases in _canvas_cache.items():
+        channel_db = db_content.get(channel_id, {})
+        updated = []
+        for canvas_id, _ in canvases:
+            saved_content = channel_db.get(canvas_id, "")
+            updated.append((canvas_id, saved_content))
+            if saved_content:
+                logger.info(
+                    "Canvas preloaded from DB: channel=%s canvas=%s (%d chars)",
+                    channel_id, canvas_id, len(saved_content),
+                )
+        _canvas_cache[channel_id] = updated
+
+
 async def refresh_all_canvases(bot_token: str) -> None:
-    """Fetch all mapped canvases at startup or on poll cycle."""
+    """Fetch all mapped canvases from Slack API and persist to MongoDB."""
     for channel_id in list(_canvas_cache.keys()):
         await refresh_canvas(channel_id, bot_token)
 
 
 def get_canvas_content(channel_id: str) -> str:
-    """Return all cached canvas content for a channel combined. Empty string if none."""
+    """Return all cached canvas content for a channel combined."""
     canvases = _canvas_cache.get(channel_id)
     if not canvases:
         return ""
