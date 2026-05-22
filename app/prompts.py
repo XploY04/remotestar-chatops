@@ -6,7 +6,7 @@ import re
 
 from app.config import PLANE_HOST, settings
 from app.instructions import get_instructions
-from app.plane import plane_members_cache, plane_states_cache
+from app.plane import mcp, plane_members_cache, plane_states_cache
 
 
 HELP_TEXT_PLANE = """*RemoteStar ChatOps* — what I can do here:
@@ -178,6 +178,26 @@ def _build_plane_prompt(channel_id: str | None) -> str:
             + "\n"
         )
 
+    # Mixpanel availability is dynamic: the MCP subprocess may or may not
+    # be connected at request time. Only mention it in the prompt when the
+    # session is actually live, otherwise the LLM might try to call
+    # mixpanel__* tools that aren't in the tools array.
+    mixpanel_block = ""
+    if "mixpanel" in mcp.sessions:
+        mixpanel_block = (
+            "\n## Mixpanel analytics (also available in this channel)\n"
+            "Beyond Plane, you can run Mixpanel queries, list events/properties, "
+            "manage dashboards, and pull session replays via tools prefixed "
+            "`mixpanel__`. Route to Mixpanel when the user asks for numbers, "
+            "funnels, retention, event activity, or anything that lives in "
+            "product analytics. Route to Plane (or `chatops__*`) for ticket ops. "
+            "Rate-limited at 600 Mixpanel requests/hour across all users; on a "
+            "429, surface the error and stop, don't auto-retry. For destructive "
+            "Mixpanel tools (Delete-*, Bulk-Edit-*, Update-Feature-Flag), "
+            "summarize what you're about to do and ask the user to confirm "
+            "before calling.\n"
+        )
+
     return f"""You are RemoteStar's ChatOps assistant in Slack. You help the team manage Plane tickets through natural language.
 
 ## Workspace context
@@ -192,7 +212,7 @@ def _build_plane_prompt(channel_id: str | None) -> str:
 - recruiter, recruiters, hiring, ATS, scraper, talent, dashboard → RECRUITER
 - If the user explicitly says a project, use it without confirming
 - If genuinely ambiguous, ask "CANDIDATE or RECRUITER?"
-{members_block}{states_block}
+{members_block}{states_block}{mixpanel_block}
 ## Setting state and labels on update_work_item
 - `state` → must be a state UUID from the per-project list above, not a name. If the user says "set to Done in CANDIDATE", look up Done's UUID under CANDIDATE and pass that.
 - `labels` → must be a list of label UUIDs, not label names. We don't have a labels lookup table cached. If the user asks to add/remove labels by name, call `plane__list_labels` with the project_id first to get the UUIDs, then pass those.

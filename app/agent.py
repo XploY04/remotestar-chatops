@@ -58,8 +58,15 @@ async def agent_loop(
         await audit_log(user_slack_id, user_email, [], final)
         return final, None
 
-    # Tool-using modes: scope the toolset to the mode's MCP server so plane
-    # channels can't accidentally invoke mixpanel tools (and vice versa).
+    # Tool-using modes:
+    #   mixpanel  → mixpanel tools only (kept tight so analytics-only channels
+    #               can't create tickets by mistake).
+    #   plane     → plane tools + Mixpanel tools (when the Mixpanel MCP is
+    #               connected). Plane channels are the engineering room where
+    #               having both ticket ops and ad-hoc analytics in one place
+    #               is the design goal. The Mixpanel union is self-gating:
+    #               when the MCP isn't running, openai_tools(server="mixpanel")
+    #               returns an empty list and plane behavior is unchanged.
     if mode == "mixpanel":
         tools = mcp.openai_tools(server="mixpanel")
         no_tools_msg = (
@@ -67,7 +74,11 @@ async def agent_loop(
             "Try again in a moment, or ping someone to re-run OAuth bootstrap."
         )
     else:  # plane (and any future Plane-style modes)
-        tools = mcp.openai_tools(server="plane") + LOCAL_TOOL_DEFS
+        tools = (
+            mcp.openai_tools(server="plane")
+            + mcp.openai_tools(server="mixpanel")
+            + LOCAL_TOOL_DEFS
+        )
         no_tools_msg = "I'm not connected to any backends right now. Try again in a moment."
 
     if not tools:
