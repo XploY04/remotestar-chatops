@@ -1,4 +1,5 @@
-"""Slack listeners: app_mention, message (DM), slash command, reaction_added.
+"""Slack listeners: app_mention, message (DM), slash command, reaction_added,
+canvas_updated.
 
 Mode is resolved per request via app.instructions.resolve_mode(channel). If a
 channel has no instructions file, the bot drops the event silently (no fallback
@@ -10,8 +11,12 @@ import json
 import re
 
 from app.agent import agent_loop
-from app.config import logger
-from app.instructions import resolve_mode
+from app.config import logger, settings
+from app.instructions import (
+    get_channel_id_for_canvas,
+    refresh_canvas,
+    resolve_mode,
+)
 from app.plane import (
     attach_slack_files_to_plane_issue,
     looks_like_uuid,
@@ -264,9 +269,6 @@ async def mention_lazy(event, client):
     text = strip_bot_mention(event.get("text", "") or "")
     files = event.get("files") or []
 
-    # In plane mode, pick up files dropped earlier in the thread (so users can
-    # mention us in a follow-up). In chatbot mode, attachments are ignored
-    # entirely so don't bother scanning.
     if mode == "plane" and not files and event.get("thread_ts"):
         files = await collect_thread_files(client, channel, event["thread_ts"])
         if files:
@@ -313,7 +315,7 @@ async def dm_lazy(event, client):
     if event.get("channel_type") != "im":
         return
     if event.get("bot_id") or event.get("subtype"):
-        return  # ignore bots and message edits/joins/etc
+        return
     bot_uid = await get_bot_user_id(client)
     if event.get("user") == bot_uid:
         return
@@ -341,7 +343,7 @@ async def dm_lazy(event, client):
         text=text,
         files=files,
         thread_ts=event.get("thread_ts"),
-        reply_ts=event.get("thread_ts"),  # keep flat unless already in a thread
+        reply_ts=event.get("thread_ts"),
         mode=mode,
     )
 
@@ -364,7 +366,6 @@ EMOJI_TO_STATE_GROUP: dict[str, str] = {
     "no_entry_sign": "cancelled",
 }
 
-# Match a Plane issue URL (works for both the encoded and decoded forms Slack stores)
 _ISSUE_URL_RE = re.compile(
     r"plane\.remotestar\.io/[^/\s>|]+/projects/([0-9a-f-]{36})/issues/([0-9a-f-]{36})",
     re.IGNORECASE,
@@ -389,7 +390,6 @@ async def reaction_lazy(event, client):
     if not channel or not msg_ts:
         return
 
-    # Only act in plane-mode channels (DMs included if dm.md is plane).
     if resolve_mode(channel) != "plane":
         return
 
@@ -407,7 +407,7 @@ async def reaction_lazy(event, client):
 
     bot_uid = await get_bot_user_id(client)
     if msg.get("user") != bot_uid and not msg.get("bot_id"):
-        return  # only act on our own messages
+        return
 
     text = msg.get("text") or ""
     m = _ISSUE_URL_RE.search(text)
@@ -431,7 +431,7 @@ async def reaction_lazy(event, client):
     })
     state_name = (plane_states_cache.get(state_id) or {}).get("name") or target_group
     try:
-        json.loads(result)  # if it parses, the update worked
+        json.loads(result)
         await client.chat_postMessage(
             channel=channel,
             thread_ts=msg_ts,
@@ -442,3 +442,39 @@ async def reaction_lazy(event, client):
 
 
 slack_app.event("reaction_added")(ack=reaction_ack, lazy=[reaction_lazy])
+
+
+# ---------------------------------------------------------------------------
+# Canvas update handler — real-time canvas sync
+# ---------------------------------------------------------------------------
+
+
+async def canvas_ack(ack):
+    await ack()
+
+
+async def canvas_lazy(event, client):
+    """Re-fetch canvas content when a Slack canvas is updated."""
+    canvas_id = event.get("canvas_id")
+    if not canvas_id:
+        return
+
+    channel_id = get_channel_id_for_canvas(canvas_id)
+    if not channel_id:
+        logger.info(
+            "Canvas %s updated but not mapped to any channel — ignoring", canvas_id
+        )
+        return
+
+    logger.info(
+        "Canvas %s updated — refreshing context for channel %s", canvas_id, channel_id
+    )
+    try:
+        await refresh_canvas(channel_id, settings.slack_bot_token)
+    except Exception as e:
+        logger.warning(
+            "Failed to refresh canvas %s for channel %s: %s", canvas_id, channel_id, e
+        )
+
+
+slack_app.event("canvas_updated")(ack=canvas_ack, lazy=[canvas_lazy])
