@@ -1,6 +1,9 @@
 """LLM tool-calling loop. Mode-aware:
-- "plane": full MCP toolset + LOCAL_TOOL_DEFS, multi-turn tool loop.
-- "chatbot": no tools, single completion call.
+- "plane":    Plane MCP toolset + chatops__* local tools, multi-turn loop.
+- "mixpanel": Mixpanel MCP toolset only, multi-turn loop. No Plane tools so
+              an analytics channel can't accidentally create tickets, and
+              vice versa.
+- "chatbot":  no tools, single completion call.
 """
 
 from __future__ import annotations
@@ -55,10 +58,20 @@ async def agent_loop(
         await audit_log(user_slack_id, user_email, [], final)
         return final, None
 
-    # Plane mode: full tool loop.
-    tools = mcp.openai_tools() + LOCAL_TOOL_DEFS
+    # Tool-using modes: scope the toolset to the mode's MCP server so plane
+    # channels can't accidentally invoke mixpanel tools (and vice versa).
+    if mode == "mixpanel":
+        tools = mcp.openai_tools(server="mixpanel")
+        no_tools_msg = (
+            "The Mixpanel backend isn't connected right now. "
+            "Try again in a moment, or ping someone to re-run OAuth bootstrap."
+        )
+    else:  # plane (and any future Plane-style modes)
+        tools = mcp.openai_tools(server="plane") + LOCAL_TOOL_DEFS
+        no_tools_msg = "I'm not connected to any backends right now. Try again in a moment."
+
     if not tools:
-        return "I'm not connected to any backends right now. Try again in a moment.", None
+        return no_tools_msg, None
 
     tool_call_log: list[dict] = []
     created_issue: dict | None = None

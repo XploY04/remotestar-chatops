@@ -173,9 +173,10 @@ journalctl -u chatops -f  # tail logs
 
 ## Channel modes and the `instructions/` directory
 
-The bot runs in one of two modes per channel:
+The bot runs in one of three modes per channel:
 
 - **plane**: full Plane MCP toolset, attachment uploads, reaction-driven status. For engineering teams using Plane.
+- **mixpanel**: Mixpanel MCP toolset only (no Plane). For analytics channels. Requires the optional setup in "Adding Mixpanel" below.
 - **chatbot**: no tools, no attachments, no reactions. A general-purpose assistant with channel-specific context. For teams that don't use Plane (marketing, BD, sales, tech-discussion, etc.).
 
 The bot only responds in channels it knows about. Two ways to make it know about a channel:
@@ -185,18 +186,21 @@ instructions/
 ├── plane/
 │   ├── <channel_id>.md     # one file per Plane-mode channel
 │   └── dm.md               # if present, DMs run in plane mode
-└── chatbot/
-    ├── <channel_id>.md     # one file per chatbot-mode channel
-    └── dm.md               # if present, DMs run in chatbot mode
+├── chatbot/
+│   ├── <channel_id>.md     # one file per chatbot-mode channel
+│   └── dm.md               # if present, DMs run in chatbot mode
+└── mixpanel/
+    ├── <channel_id>.md     # one file per Mixpanel-mode channel
+    └── dm.md               # if present, DMs run in mixpanel mode
 ```
 
-1. **Per-channel file (highest priority).** Drop a markdown file under `instructions/plane/` or `instructions/chatbot/`. Filename is the Slack channel ID with `.md` extension (e.g. `C0B0E9R0PE0.md`). The file's contents are appended verbatim to the system prompt as that channel's custom context. Mode comes from the parent directory.
-2. **`DEFAULT_CHANNEL_MODE` env var (fallback).** Set it to `chatbot` (or `plane`) in `.env` and the bot uses that mode for any channel it's invited to that doesn't have a specific file. Per-channel files still win.
+1. **Per-channel file (highest priority).** Drop a markdown file under `instructions/plane/`, `instructions/chatbot/`, or `instructions/mixpanel/`. Filename is the Slack channel ID with `.md` extension (e.g. `C0B0E9R0PE0.md`). The file's contents are appended verbatim to the system prompt as that channel's custom context. Mode comes from the parent directory.
+2. **`DEFAULT_CHANNEL_MODE` env var (fallback).** Set it to `chatbot`, `plane`, or `mixpanel` in `.env` and the bot uses that mode for any channel it's invited to that doesn't have a specific file. Per-channel files still win.
 3. **Neither set.** The bot stays silent. It logs `Mention in unconfigured channel C... — ignoring` so you can see who tried.
 
-`dm.md` is a special filename. Whichever subdirectory it sits in defines DM behavior. If both `plane/dm.md` and `chatbot/dm.md` exist, the bot logs a warning and uses `plane/dm.md`. If neither exists, DMs fall through to `DEFAULT_CHANNEL_MODE` (if set), otherwise are silently ignored.
+`dm.md` is a special filename. Whichever subdirectory it sits in defines DM behavior. If multiple `<mode>/dm.md` files exist, priority is plane > mixpanel > chatbot and the bot logs a warning. If none exist, DMs fall through to `DEFAULT_CHANNEL_MODE` (if set), otherwise are silently ignored.
 
-The same channel ID under both `plane/` and `chatbot/` is rejected at load with a warning; one wins, the other is dropped.
+The same channel ID under multiple mode directories is rejected at load with a warning; the first one in priority order wins, the others are dropped.
 
 After editing the directory or `.env`: `systemctl restart chatops`. Hot reload is a future enhancement; for now the bot reads `instructions/` and `settings.default_channel_mode` once at startup.
 
@@ -345,6 +349,82 @@ ssh rs /root/chatops-deploy.sh
 ```
 
 Same script the workflow runs. Fails the same way on a bad commit.
+
+## Adding Mixpanel
+
+Mixpanel ships a hosted MCP server (no self-hosted binary), reachable over HTTP at `https://mcp.mixpanel.com/mcp`, with OAuth + PKCE the only supported auth. The bot reaches it through `npx mcp-remote` running as a stdio subprocess, which acts as a stdio-to-HTTP bridge for our MCP client.
+
+Side effects of choosing this MCP:
+
+- **One OAuth identity, shared by all chatops users.** Mixpanel queries appear in their audit log as the person who did the OAuth bootstrap. Rate limit is 600 requests/hour, total across everyone using the bot.
+- **Tokens live in `~/.mcp-auth/` on the rs box.** Refresh tokens expire (Mixpanel doesn't document the TTL; weeks to months is typical). When they do, the integration silently fails and you re-bootstrap.
+- **Node 20+ required.** `mcp-remote` depends on `undici@7`, which needs Node ≥ 20.18. The system Node on rs is still 18 for other services. A second Node lives at `/opt/node20/bin` just for this subprocess.
+
+### 1. Org-side prerequisite
+
+A Mixpanel org admin must enable MCP in **Settings → Org → Overview**. Without that toggle, OAuth will succeed but every tool call returns `forbidden`.
+
+### 2. Install Node 20 on rs (one-time)
+
+```bash
+ssh rs
+cd /opt
+curl -fsSL https://nodejs.org/dist/v20.19.0/node-v20.19.0-linux-x64.tar.xz -o /tmp/node20.tar.xz
+tar -xJf /tmp/node20.tar.xz
+ln -sfn /opt/node-v20.19.0-linux-x64 /opt/node20
+rm /tmp/node20.tar.xz
+/opt/node20/bin/node --version   # should print v20.19.0
+```
+
+Existing services that use `/usr/bin/node` (still v18) are unaffected.
+
+### 3. OAuth bootstrap on your laptop
+
+The OAuth flow opens a browser. The cleanest path is to do it on your laptop, then copy the resulting token store to rs.
+
+```bash
+# Local: complete OAuth in your browser
+npx -y mcp-remote https://mcp.mixpanel.com/mcp
+# A browser pops; sign in as the Mixpanel user the bot should act as.
+# Once signed in, the process keeps running. Ctrl+C is fine; tokens are persisted.
+
+# Copy the resulting token store to rs:
+scp -r -P 2424 ~/.mcp-auth root@plane.remotestar.io:/root/
+```
+
+### 4. Enable the flag and restart
+
+```bash
+ssh rs
+echo 'MIXPANEL_MCP_ENABLED=true' >> /root/remotestar-chatops/.env
+systemctl restart chatops
+curl -sf http://localhost:9001/health
+# Expect: {"status":"ok","mcp_servers":["plane","mixpanel"]}
+journalctl -u chatops --no-pager -n 20 | grep "MCP server"
+# Expect: MCP server 'plane' ready with NN tools
+#         MCP server 'mixpanel' ready with NN tools
+```
+
+If the Mixpanel line doesn't appear, the journal will show why (most commonly an expired refresh token; redo step 3).
+
+### 5. Add channels
+
+Drop a markdown file under `instructions/mixpanel/<channel_id>.md` and commit. Push to `prod` and the CI/CD deploy restarts the bot, which picks up the new channel.
+
+### Rotating the OAuth identity
+
+When the refresh token expires, or you want to change who the bot acts as:
+
+```bash
+# Local: re-bootstrap (overwrites ~/.mcp-auth with the new identity's tokens)
+rm -rf ~/.mcp-auth
+npx -y mcp-remote https://mcp.mixpanel.com/mcp
+
+# Replace tokens on rs
+ssh rs 'rm -rf /root/.mcp-auth'
+scp -r -P 2424 ~/.mcp-auth root@plane.remotestar.io:/root/
+ssh rs 'systemctl restart chatops'
+```
 
 ## Adding a new service (e.g. GitHub)
 

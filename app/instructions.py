@@ -6,19 +6,22 @@ Layout:
     ├── plane/
     │   ├── <channel_id>.md        # one markdown file per Plane-mode channel
     │   └── dm.md                  # if present, DMs run in plane mode
-    └── chatbot/
-        ├── <channel_id>.md        # one markdown file per chatbot-mode channel
-        └── dm.md                  # if present, DMs run in chatbot mode
+    ├── chatbot/
+    │   ├── <channel_id>.md        # one markdown file per chatbot-mode channel
+    │   └── dm.md                  # if present, DMs run in chatbot mode
+    └── mixpanel/
+        ├── <channel_id>.md        # one markdown file per Mixpanel-mode channel
+        └── dm.md                  # if present, DMs run in mixpanel mode
 
 Mode is implied by the parent directory. Filename is the Slack channel ID with
 a `.md` extension; the file's contents are appended verbatim to the system
 prompt as that channel's custom context.
 
 Default behavior is strict opt-in: a channel without a file gets no response.
-Setting DEFAULT_CHANNEL_MODE=chatbot (or plane) in the env switches on a
-fallback so any channel the bot is invited to gets handled with that mode
-when no specific file is present. Per-channel files always win over the
-fallback.
+Setting DEFAULT_CHANNEL_MODE=chatbot (or plane / mixpanel) in the env
+switches on a fallback so any channel the bot is invited to gets handled
+with that mode when no specific file is present. Per-channel files always
+win over the fallback.
 
 Canvas integration:
     Certain channels can be linked to one or more Slack canvases. Canvas
@@ -39,6 +42,17 @@ INSTRUCTIONS_DIR = Path(__file__).resolve().parent.parent / "instructions"
 
 PLANE_DIR = INSTRUCTIONS_DIR / "plane"
 CHATBOT_DIR = INSTRUCTIONS_DIR / "chatbot"
+MIXPANEL_DIR = INSTRUCTIONS_DIR / "mixpanel"
+
+# Modes recognised by the loader and DEFAULT_CHANNEL_MODE validator.
+# Tuple order also defines dm.md resolution priority when multiple
+# `<mode>/dm.md` files exist (plane > mixpanel > chatbot).
+_MODE_DIRS: tuple[tuple[str, Path], ...] = (
+    ("plane", PLANE_DIR),
+    ("mixpanel", MIXPANEL_DIR),
+    ("chatbot", CHATBOT_DIR),
+)
+_VALID_MODES = {m for m, _ in _MODE_DIRS}
 
 # In-memory cache populated by load_instructions(): channel_id -> (mode, body)
 _cache: dict[str, tuple[str, str]] = {}
@@ -182,12 +196,12 @@ def load_instructions() -> None:
     _default_mode = None
 
     configured = (settings.default_channel_mode or "").strip().lower() or None
-    if configured in ("plane", "chatbot"):
+    if configured in _VALID_MODES:
         _default_mode = configured
     elif configured:
         logger.warning(
-            "DEFAULT_CHANNEL_MODE=%r is not 'plane' or 'chatbot'; ignoring",
-            settings.default_channel_mode,
+            "DEFAULT_CHANNEL_MODE=%r is not one of %s; ignoring",
+            settings.default_channel_mode, sorted(_VALID_MODES),
         )
 
     if not INSTRUCTIONS_DIR.exists():
@@ -197,10 +211,9 @@ def load_instructions() -> None:
         )
         return
 
-    plane_dm = PLANE_DIR / "dm.md"
-    chatbot_dm = CHATBOT_DIR / "dm.md"
+    dm_files = [(mode, dir_path / "dm.md") for mode, dir_path in _MODE_DIRS]
 
-    for mode, dir_path in (("plane", PLANE_DIR), ("chatbot", CHATBOT_DIR)):
+    for mode, dir_path in _MODE_DIRS:
         if not dir_path.exists():
             continue
         for md_file in dir_path.iterdir():
@@ -212,22 +225,25 @@ def load_instructions() -> None:
             body = md_file.read_text(encoding="utf-8").strip()
             if stem in _cache:
                 logger.warning(
-                    "Channel %s has files in both plane/ and chatbot/; ignoring %s",
+                    "Channel %s has files in multiple mode directories; "
+                    "first match wins, ignoring %s",
                     stem, md_file,
                 )
                 continue
             _cache[stem] = (mode, body)
 
-    if plane_dm.exists() and chatbot_dm.exists():
+    # dm.md resolution: priority order from _MODE_DIRS (plane > mixpanel > chatbot).
+    present_dms = [(mode, path) for mode, path in dm_files if path.exists()]
+    if len(present_dms) > 1:
+        winner_mode, _ = present_dms[0]
+        rest = ", ".join(f"instructions/{m}/dm.md" for m, _ in present_dms[1:])
         logger.warning(
-            "Both instructions/plane/dm.md and instructions/chatbot/dm.md exist; using plane/"
+            "Multiple dm.md files present; using instructions/%s/dm.md, ignoring %s",
+            winner_mode, rest,
         )
-    if plane_dm.exists():
-        _dm_mode = "plane"
-        _dm_body = plane_dm.read_text(encoding="utf-8").strip()
-    elif chatbot_dm.exists():
-        _dm_mode = "chatbot"
-        _dm_body = chatbot_dm.read_text(encoding="utf-8").strip()
+    if present_dms:
+        _dm_mode, dm_path = present_dms[0]
+        _dm_body = dm_path.read_text(encoding="utf-8").strip()
 
     summary = (
         ", ".join(f"{cid}={mode}" for cid, (mode, _) in _cache.items()) or "(none)"
@@ -247,7 +263,7 @@ def reload_instructions() -> None:
 
 
 def resolve_mode(channel_id: str | None) -> str | None:
-    """Return 'plane' / 'chatbot' / None for a Slack channel ID."""
+    """Return 'plane' / 'chatbot' / 'mixpanel' / None for a Slack channel ID."""
     if not channel_id:
         return None
     if channel_id.startswith("D"):
