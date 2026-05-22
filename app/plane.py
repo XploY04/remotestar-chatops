@@ -39,6 +39,21 @@ MCP_SERVERS: dict[str, StdioServerParameters] = {
     # Future: "github": StdioServerParameters(...)
 }
 
+# Hosted Mixpanel MCP server, reached over HTTP via `mcp-remote` which we run
+# as a stdio subprocess. `mcp-remote` needs Node 20+; the system Node on rs is
+# still on 18 for other services, so we prepend settings.node20_bin to PATH so
+# only this subprocess (and the npm scripts it spawns) picks up the newer
+# runtime. OAuth tokens are read from ~/.mcp-auth (HOME below).
+if settings.mixpanel_mcp_enabled:
+    MCP_SERVERS["mixpanel"] = StdioServerParameters(
+        command=os.path.join(settings.node20_bin, "npx"),
+        args=["-y", "mcp-remote", settings.mixpanel_mcp_url],
+        env={
+            "PATH": f"{settings.node20_bin}:{os.environ.get('PATH', '')}",
+            "HOME": os.environ.get("HOME", "/root"),
+        },
+    )
+
 
 class MCPManager:
     """Spawns and holds MCP subprocesses, exposing a flat tool registry."""
@@ -71,10 +86,19 @@ class MCPManager:
     def sessions(self) -> dict[str, ClientSession]:
         return self._sessions
 
-    def openai_tools(self) -> list[dict]:
-        """Convert MCP tools to OpenAI tools schema."""
+    def openai_tools(self, server: str | None = None) -> list[dict]:
+        """Convert MCP tools to OpenAI tools schema.
+
+        Pass `server` to scope the returned tools to a single MCP server
+        (e.g. 'plane' or 'mixpanel'). With no filter, every running server's
+        tools are returned. The agent loop uses this to gate which tools a
+        mode can see; Plane channels shouldn't see Mixpanel tools and vice
+        versa.
+        """
         result = []
-        for prefixed, (_, tool) in self._tool_index.items():
+        for prefixed, (srv, tool) in self._tool_index.items():
+            if server is not None and srv != server:
+                continue
             result.append({
                 "type": "function",
                 "function": {

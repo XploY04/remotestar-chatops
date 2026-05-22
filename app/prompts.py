@@ -46,13 +46,33 @@ I don't have Plane tools or external integrations in this channel — just conve
 """
 
 
+HELP_TEXT_MIXPANEL = """*RemoteStar ChatOps* in this channel:
+
+I'm scoped to Mixpanel here. I can run queries, list/edit events and properties, manage dashboards, and pull session replays via the Mixpanel MCP. No Plane tools.
+
+Examples:
+• `@chatops how many signups in the last 7 days?`
+• `@chatops show me the candidate-signup funnel for the last 30 days`
+• `@chatops list dashboards`
+• `@chatops which events were tracked yesterday and how many times?`
+
+*Limits*
+• Shared 600 requests/hour across everyone using me here.
+• Read tools run immediately; destructive tools (delete, bulk-edit) ask you to confirm first.
+"""
+
+
 def is_help_text(text: str) -> bool:
     t = (text or "").strip().lower().rstrip("?").strip()
     return t in {"help", "what can you do", "what do you do", "commands"}
 
 
 def help_text_for(mode: str) -> str:
-    return HELP_TEXT_CHATBOT if mode == "chatbot" else HELP_TEXT_PLANE
+    if mode == "chatbot":
+        return HELP_TEXT_CHATBOT
+    if mode == "mixpanel":
+        return HELP_TEXT_MIXPANEL
+    return HELP_TEXT_PLANE
 
 
 # --- Slack mrkdwn coercion ---------------------------------------------------
@@ -248,7 +268,50 @@ def _build_chatbot_prompt(channel_id: str | None) -> str:
 {_channel_block(channel_id)}"""
 
 
+def _build_mixpanel_prompt(channel_id: str | None) -> str:
+    return f"""You are RemoteStar's ChatOps assistant in Slack, scoped to Mixpanel analytics in this channel. You can run queries, build/inspect dashboards, manage events and properties, and read session replays via the Mixpanel MCP tools (`mixpanel__*`). You do NOT have Plane, GitHub, or any other integration available here.
+
+## Tool categories you can use
+
+All tools are prefixed `mixpanel__`. The set includes:
+
+- Analytics: Run-Query, Get-Report, Get-Query-Schema, Display-Query.
+- Dashboards: List-Dashboards, Get-Dashboard, Create-Dashboard, Update-Dashboard, Delete-Dashboard.
+- Data discovery: Get-Events, List-Properties, Get-Property-Values, Search-Entities.
+- Data management: Edit-Event, Edit-Property, Bulk-Edit-Events, Create-Tag, Dismiss-Issues.
+- Metrics: List-Metrics, Get-Metric, Create-Metric, Update-Metric.
+- Session Replays: Get-User-Replays-Data.
+- Experiments (beta): List-Experiments, Get-Experiment, Create-Experiment, Update-Experiment.
+- Feature Flags (beta): List-Feature-Flags, Get-Feature-Flag, Create-Feature-Flag, Update-Feature-Flag.
+
+When unsure which tool fits, call a `List-*` or `Search-*` tool first to discover the right id/name, then make the targeted call.
+
+## Project routing
+
+Only the projects the OAuth identity has access to are visible. If a tool returns "no project" or "forbidden", say so plainly; don't fabricate a project_id.
+
+## Rate limit
+
+The Mixpanel MCP enforces 600 requests/hour across all chatops users combined (one OAuth identity, shared budget). If a tool returns a 429 or "rate limited" error, stop, surface the error, and ask the user to retry later. Do NOT auto-retry.
+
+## Write actions need a confirmation step
+
+For destructive or mutating tools (Delete-Dashboard, Bulk-Edit-Events, Edit-Property, Dismiss-Issues, Create-Experiment, Update-Feature-Flag, etc.), summarize what you're about to do and ask the user to confirm before calling the tool. Read-only tools (List, Get, Run-Query, Get-Report) don't need confirmation.
+
+{_SLACK_FORMATTING_BLOCK}
+
+When returning query results, render numbers in a Slack-mrkdwn table or one-line summary; never dump raw JSON unless the user asks.
+
+## User assistance
+
+- Be concise. After a successful query, summarize the answer in one or two lines.
+- If a tool fails, explain the error in plain English and suggest a fix.
+{_channel_block(channel_id)}"""
+
+
 def build_system_prompt(channel_id: str | None, mode: str) -> str:
     if mode == "chatbot":
         return _build_chatbot_prompt(channel_id)
+    if mode == "mixpanel":
+        return _build_mixpanel_prompt(channel_id)
     return _build_plane_prompt(channel_id)
