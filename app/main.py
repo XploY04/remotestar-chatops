@@ -24,6 +24,19 @@ api = FastAPI()
 slack_handler = AsyncSlackRequestHandler(slack_app)
 _background_tasks: list[asyncio.Task] = []
 
+CANVAS_POLL_INTERVAL_SECONDS = 43200  # 12 hours
+
+
+async def canvas_poll_loop() -> None:
+    """Background task: re-fetch all mapped canvas contents every 30 minutes."""
+    while True:
+        await asyncio.sleep(CANVAS_POLL_INTERVAL_SECONDS)
+        try:
+            await refresh_all_canvases(settings.slack_bot_token)
+            logger.info("Canvas content auto-refreshed (polling)")
+        except Exception as e:
+            logger.warning("Canvas poll failed: %s", e)
+
 
 @api.post("/slack/events")
 async def slack_events(request: Request):
@@ -51,12 +64,18 @@ async def on_startup() -> None:
     await refresh_plane_states()
     load_instructions()
 
-    # Load canvas content for all mapped channels at startup
+    # Load canvas content at startup
     try:
         await refresh_all_canvases(settings.slack_bot_token)
         logger.info("Canvas content loaded at startup")
     except Exception as e:
         logger.warning("Canvas load at startup failed: %s", e)
+
+    # Start background polling for canvas updates
+    _background_tasks.append(asyncio.create_task(canvas_poll_loop()))
+    logger.info(
+        "Canvas polling started (interval: %ds)", CANVAS_POLL_INTERVAL_SECONDS
+    )
 
     if 0 <= settings.standup_hour_utc <= 23:
         _background_tasks.append(asyncio.create_task(standup_loop()))
