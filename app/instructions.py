@@ -22,12 +22,13 @@ fallback.
 
 Canvas integration:
     Certain channels can be linked to one or more Slack canvases. Canvas
-    content is fetched at startup and refreshed every 12 hours via polling.
+    content is fetched at startup and refreshed every 1 hour via polling.
     Content is persisted to MongoDB so it survives bot restarts instantly.
 """
 
 from __future__ import annotations
 
+import re as _re
 import aiohttp
 from pathlib import Path
 
@@ -72,30 +73,46 @@ _canvas_cache: dict[str, list[tuple[str, str]]] = {
 
 
 async def fetch_canvas_content(canvas_id: str, bot_token: str) -> str:
-    """Fetch canvas content from Slack API using files.info with user token."""
-    # Prefer user token for canvas access — bot token returns not_visible
+    """Fetch canvas content by downloading the raw HTML and stripping tags."""
+    # Prefer user token for canvas access
     token = settings.slack_user_token or bot_token
-    url = "https://slack.com/api/files.info"
-    headers = {
-        "Authorization": f"Bearer {token}",
-    }
-    params = {"file": canvas_id}
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params) as resp:
+            # Step 1: Get the download URL via files.info
+            async with session.get(
+                "https://slack.com/api/files.info",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"file": canvas_id},
+            ) as resp:
                 data = await resp.json()
                 if not data.get("ok"):
                     logger.warning(
                         "Canvas fetch failed for %s: %s", canvas_id, data.get("error")
                     )
                     return ""
-                file_data = data.get("file", {})
-                content = (
-                    file_data.get("plain_text") or
-                    file_data.get("preview") or
-                    ""
-                )
-                return content.strip()
+                download_url = data.get("file", {}).get("url_private_download")
+                if not download_url:
+                    logger.warning("Canvas %s has no download URL", canvas_id)
+                    return ""
+
+            # Step 2: Download the raw HTML content
+            async with session.get(
+                download_url,
+                headers={"Authorization": f"Bearer {token}"},
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "Canvas download failed for %s: HTTP %s", canvas_id, resp.status
+                    )
+                    return ""
+                html = await resp.text()
+
+        # Step 3: Strip HTML tags to get plain text
+        text = _re.sub(r"<[^>]+>", " ", html)
+        text = _re.sub(r"\s+", " ", text).strip()
+        return text
+
     except Exception as e:
         logger.warning("Canvas fetch exception for %s: %s", canvas_id, e, exc_info=True)
         return ""

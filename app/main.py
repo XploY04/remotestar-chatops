@@ -1,14 +1,10 @@
 """FastAPI entrypoint. Wires startup/shutdown, mounts the Slack request handler,
 and exposes /health. Run with `python -m app` or `uvicorn app.main:api`."""
-
 from __future__ import annotations
-
 import asyncio
-
 from fastapi import FastAPI, Request
 from motor.motor_asyncio import AsyncIOMotorClient
 from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
-
 from app import audit
 from app.config import logger, settings
 from app.instructions import (
@@ -19,7 +15,6 @@ from app.instructions import (
 from app.plane import mcp, refresh_plane_members, refresh_plane_states
 from app.slack_app import slack_app
 from app.standup import standup_loop
-
 # Importing handlers is what registers the Slack listeners on slack_app.
 # Keep this import for its side effects.
 from app import handlers  # noqa: F401
@@ -27,12 +22,11 @@ from app import handlers  # noqa: F401
 api = FastAPI()
 slack_handler = AsyncSlackRequestHandler(slack_app)
 _background_tasks: list[asyncio.Task] = []
-
-CANVAS_POLL_INTERVAL_SECONDS = 43200  # 12 hours
+CANVAS_POLL_INTERVAL_SECONDS = 3600  # 1 hour
 
 
 async def canvas_poll_loop() -> None:
-    """Background task: re-fetch all canvas contents every 12 hours."""
+    """Background task: re-fetch all canvas contents every 1 hour."""
     while True:
         await asyncio.sleep(CANVAS_POLL_INTERVAL_SECONDS)
         try:
@@ -82,7 +76,7 @@ async def on_startup() -> None:
     except Exception as e:
         logger.warning("Canvas refresh from Slack API failed: %s", e)
 
-    # Start background polling every 12 hours
+    # Start background polling every 1 hour
     _background_tasks.append(asyncio.create_task(canvas_poll_loop()))
     logger.info(
         "Canvas polling started (interval: %ds)", CANVAS_POLL_INTERVAL_SECONDS
