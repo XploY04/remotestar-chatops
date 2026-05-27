@@ -276,8 +276,8 @@ def resolve_mode(channel_id: str | None) -> str | None:
 
 
 def get_instructions(channel_id: str | None) -> str:
-    """Return the channel's instruction body (markdown text).
-    Combines .md file content + live canvas content if available."""
+    """Return the channel's instruction body, framed as an authoritative
+    knowledge base. Combines .md file content + live canvas content."""
     if not channel_id:
         return ""
 
@@ -288,11 +288,24 @@ def get_instructions(channel_id: str | None) -> str:
         md_content = entry[1] if entry else ""
 
     canvas_content = get_canvas_content(channel_id)
-    if canvas_content:
-        return (
-            f"{md_content}\n\n"
-            f"## Live Canvas Content (auto-synced from Slack)\n"
-            f"{canvas_content}"
-        ).strip()
+
+    if canvas_content or md_content:
+        parts = [
+            "# Team Knowledge Base",
+            "",
+            "The content below is this team's authoritative knowledge base — "
+            "playbooks, policies, processes, and team-specific guidance. "
+            "Treat this as the primary source of truth when answering questions. "
+            "If the answer to a user's question is here, use it directly and confidently.",
+        ]
+        if md_content:
+            parts.append("")
+            parts.append("## Static team instructions")
+            parts.append(md_content)
+        if canvas_content:
+            parts.append("")
+            parts.append("## Live canvas content (auto-synced from Slack every hour)")
+            parts.append(canvas_content)
+        return "\n".join(parts).strip()
 
     return md_content
