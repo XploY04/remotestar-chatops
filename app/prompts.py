@@ -110,11 +110,11 @@ def _channel_block(channel_id: str | None) -> str:
     body = get_instructions(channel_id).strip() if channel_id else ""
     if not body:
         return ""
-    # The body from get_instructions() already contains its own
-    # "Team Knowledge Base" header and authoritative framing, so we
-    # don't wrap it in another "Channel context" header — that would
-    # nest headings and dilute the source-of-truth signal.
-    return f"\n{body}\n"
+    return (
+        "\n## Channel context\nThe instructions below are specific to this Slack channel and override "
+        "the generic guidance above when there's a conflict.\n\n"
+        f"{body}\n"
+    )
 
 
 def _build_plane_prompt(channel_id: str | None) -> str:
@@ -136,7 +136,6 @@ def _build_plane_prompt(channel_id: str | None) -> str:
             "If you need to assign someone, call `plane__get_workspace_members` first to get their Plane user_id (UUID).\n"
         )
 
-    # Per-project states block, sorted by group order so the LLM can pick fluently.
     GROUP_ORDER = ["backlog", "unstarted", "started", "completed", "cancelled"]
     states_block = ""
     if plane_states_cache:
@@ -178,10 +177,6 @@ def _build_plane_prompt(channel_id: str | None) -> str:
             + "\n"
         )
 
-    # Mixpanel availability is dynamic: the MCP subprocess may or may not
-    # be connected at request time. Only mention it in the prompt when the
-    # session is actually live, otherwise the LLM might try to call
-    # mixpanel__* tools that aren't in the tools array.
     mixpanel_block = ""
     if "mixpanel" in mcp.sessions:
         mixpanel_block = (
