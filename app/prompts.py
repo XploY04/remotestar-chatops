@@ -75,17 +75,12 @@ def help_text_for(mode: str) -> str:
     return HELP_TEXT_PLANE
 
 
-# --- Slack mrkdwn coercion ---------------------------------------------------
-
 _MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
 _MD_BOLD_RE = re.compile(r"\*\*([^\n*][^\n]*?)\*\*")
 _MD_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.*?)[ \t]*$", re.MULTILINE)
 
 
 def to_slack_mrkdwn(text: str) -> str:
-    """Best-effort conversion of common standard-markdown patterns the LLM
-    sometimes emits into Slack's mrkdwn dialect. Safety net only — the system
-    prompt also tells the LLM to write mrkdwn directly."""
     if not text:
         return text
     text = _MD_LINK_RE.sub(r"<\2|\1>", text)
@@ -93,8 +88,6 @@ def to_slack_mrkdwn(text: str) -> str:
     text = _MD_HEADING_RE.sub(r"*\1*", text)
     return text
 
-
-# --- System prompt -----------------------------------------------------------
 
 _SLACK_FORMATTING_BLOCK = """## Slack message formatting (mrkdwn, NOT standard markdown)
 Slack uses its own variant of markdown. Output your replies in that syntax — never standard CommonMark/GitHub markdown.
@@ -106,29 +99,29 @@ Slack uses its own variant of markdown. Output your replies in that syntax — n
 - Strikethrough: `~text~`."""
 
 
-def _channel_block(channel_id: str | None) -> str:
+def _channel_block(channel_id):
     body = get_instructions(channel_id).strip() if channel_id else ""
     if not body:
         return ""
-    # The body from get_instructions() already contains its own
-    # "Team Knowledge Base" header and authoritative framing, so we
-    # don't wrap it in another "Channel context" header — that would
-    # nest headings and dilute the source-of-truth signal.
-    return f"\n{body}\n"
+    return (
+        "\n## Channel context\nThe instructions below are specific to this Slack channel and override "
+        "the generic guidance above when there's a conflict.\n\n"
+        + body + "\n"
+    )
 
 
-def _build_plane_prompt(channel_id: str | None) -> str:
+def _build_plane_prompt(channel_id):
     members_block = ""
     if plane_members_cache:
         rows = "\n".join(
-            f"- `{m['email']}` → `{m['id']}` ({m.get('display_name', '')})"
+            "- `" + m["email"] + "` → `" + m["id"] + "` (" + m.get("display_name", "") + ")"
             for m in plane_members_cache
         )
         members_block = (
             "\n## Plane workspace members (email → user_id)\n"
             "Use this map to resolve assignees. The `assignees` field on `plane__create_work_item` "
             "expects a list of Plane user_id values (UUIDs), NOT emails or Slack IDs.\n\n"
-            f"{rows}\n"
+            + rows + "\n"
         )
     else:
         members_block = (
@@ -136,11 +129,10 @@ def _build_plane_prompt(channel_id: str | None) -> str:
             "If you need to assign someone, call `plane__get_workspace_members` first to get their Plane user_id (UUID).\n"
         )
 
-    # Per-project states block, sorted by group order so the LLM can pick fluently.
     GROUP_ORDER = ["backlog", "unstarted", "started", "completed", "cancelled"]
     states_block = ""
     if plane_states_cache:
-        project_to_states: dict[str, list[dict]] = {}
+        project_to_states = {}
         for sid, info in plane_states_cache.items():
             project_to_states.setdefault(info.get("project_id") or "", []).append({
                 "id": sid,
@@ -164,9 +156,9 @@ def _build_plane_prompt(channel_id: str | None) -> str:
             states = project_to_states.get(project_id) or []
             if not states:
                 continue
-            lines = [f"### {label}"]
+            lines = ["### " + label]
             for s in states:
-                lines.append(f"- {s['name']} ({s['group']}) → `{s['id']}`")
+                lines.append("- " + s["name"] + " (" + s["group"] + ") → `" + s["id"] + "`")
             sections.append("\n".join(lines))
 
         states_block = (
@@ -178,87 +170,115 @@ def _build_plane_prompt(channel_id: str | None) -> str:
             + "\n"
         )
 
-    # Mixpanel availability is dynamic: the MCP subprocess may or may not
-    # be connected at request time. Only mention it in the prompt when the
-    # session is actually live, otherwise the LLM might try to call
-    # mixpanel__* tools that aren't in the tools array.
     mixpanel_block = ""
     if "mixpanel" in mcp.sessions:
         mixpanel_block = (
             "\n## Mixpanel analytics (read-only in this channel)\n"
             "You can answer product-analytics questions via Mixpanel MCP "
             "tools prefixed `mixpanel__`. In plane-mode channels (like this "
-            "one) only the read-only Mixpanel tools are exposed: `Run-Query`, "
-            "`Get-Query-Schema`, `Get-Report`, `Display-Query`, `Get-Projects`, "
-            "`Get-Events`, `List-Properties`, `Get-Property-Values`, "
-            "`Search-Entities`, `Get-Business-Context`, `Get-Issues`, "
-            "`List-Metrics`, `Get-Metric`, `List-Dashboards`, `Get-Dashboard`. "
-            "Mutating ops (Edit-*, Delete-*, Bulk-Edit-*, Create-Metric, "
-            "Update-Feature-Flag, etc.) are not available here; tell the user "
-            "to go to a Mixpanel-mode channel like #tech for those.\n\n"
-            "Workflow for any analytics question: `Get-Projects` to find the "
-            "project, `Get-Events` (and `List-Properties` if needed) to find "
-            "the event, then `Run-Query` (call `Get-Query-Schema` first for "
-            "non-trivial queries). `Get-Projects` alone is never a sufficient "
-            "answer; keep going until you have a number.\n\n"
-            "Never refuse based on speculation about regions or permissions. "
-            "Only surface a refusal when a tool you actually called returned a "
-            "real error message; quote that message. Rate limit is 600 "
-            "Mixpanel requests/hour across all users; on a 429, stop.\n"
+            "one) only the read-only Mixpanel tools are exposed. "
+            "Mutating ops are not available here; tell the user "
+            "to go to a Mixpanel-mode channel like #tech for those.\n"
         )
 
-    return f"""You are RemoteStar's ChatOps assistant in Slack. You help the team manage Plane tickets through natural language.
+    workspace_slug = settings.plane_workspace_slug
+    candidate_id = settings.plane_project_candidate
+    recruiter_id = settings.plane_project_recruiter
 
-## Workspace context
-- Plane workspace slug: `{settings.plane_workspace_slug}`
-- Plane host: `{PLANE_HOST}`
-- Two projects available:
-  - **CANDIDATE** (id: `{settings.plane_project_candidate}`) — candidate-facing app, profiles, jobs, interviews, matching, signup, resume
-  - **RECRUITER** (id: `{settings.plane_project_recruiter}`) — recruiter dashboard, hiring flows, ATS integration, talent, scrapers
+    return (
+        "You are RemoteStar's ChatOps assistant in Slack. You help the team manage Plane tickets through natural language.\n\n"
+        "## Workspace context\n"
+        "- Plane workspace slug: `" + workspace_slug + "`\n"
+        "- Plane host: `" + PLANE_HOST + "`\n"
+        "- Two projects available:\n"
+        "  - **CANDIDATE** (id: `" + candidate_id + "`) — candidate-facing app, profiles, jobs, interviews, matching, signup, resume\n"
+        "  - **RECRUITER** (id: `" + recruiter_id + "`) — recruiter dashboard, hiring flows, ATS integration, talent, scrapers\n\n"
+        "## How to pick the project (be decisive, don't over-ask)\n"
+        "- candidate, candidates, profile, signup, interview, jobs, matching, resume → CANDIDATE\n"
+        "- recruiter, recruiters, hiring, ATS, scraper, talent, dashboard → RECRUITER\n"
+        "- If the user explicitly says a project, use it without confirming\n"
+        "- If genuinely ambiguous, ask \"CANDIDATE or RECRUITER?\"\n"
+        + members_block + states_block + mixpanel_block +
+        "\n## Setting state and labels on update_work_item\n"
+        "- `state` → must be a state UUID from the per-project list above, not a name.\n"
+        "- `labels` → must be a list of label UUIDs, not label names. Call `plane__list_labels` with the project_id first.\n"
+        "- If you can't find a matching state/label, tell the user what valid options exist; do NOT fabricate a UUID.\n\n"
+        "## Assigning tickets\n"
+        "- The user's message may contain emails — these come from Slack `@mentions` already resolved to emails.\n"
+        "- For create and update tools, the `assignees` field expects a list of Plane user_id UUIDs.\n"
+        "- If you can't find a matching member, tell the user clearly.\n\n"
+        "## Listing and searching work items\n"
+        "Our API key has a hard limitation: ANY filter parameter on `plane__list_work_items` routes through Plane's advanced-search endpoint which returns HTTP 403. Do NOT pass any filters.\n\n"
+        "What works:\n"
+        "- `plane__list_work_items` with ONLY `project_id` (no other filters)\n"
+        "- `plane__search_work_items` with a `query` — free-text workspace-wide search\n"
+        "- `plane__retrieve_work_item_by_identifier` with `project_identifier` (RECRUITER or CANDIDATE) and `issue_identifier`\n\n"
+        "How to handle common requests:\n"
+        "- \"list my tickets\" / \"list X's tickets\" → ALWAYS use `chatops__list_assigned_tickets`\n"
+        "- \"find tickets about X\" → use `plane__search_work_items(query=\"X\")`\n"
+        "- \"show me RECRUITER-106\" → use `plane__retrieve_work_item_by_identifier`\n\n"
+        "## Issue URL format\n"
+        "Self-hosted Plane URL: `" + PLANE_HOST + "/" + workspace_slug + "/projects/<PROJECT_ID>/issues/<ISSUE_ID>/`\n\n"
+        "## Slack file attachments\n"
+        "- If files were attached, the host application will upload them automatically AFTER your tool calls finish.\n"
+        "- Do NOT include any img tags. Do NOT make up image URLs.\n"
+        "- Do NOT apologize. Just operate on the right work item.\n\n"
+        "## Never use placeholder strings\n"
+        "Never pass literal strings like `<OLD_TICKET_ID>` as tool arguments. If you don't have a real UUID, call list/search/retrieve first.\n\n"
+        "## Tool naming\n"
+        "Tools are prefixed with `<server>__<tool>`. For Plane tools, use the `plane__*` names.\n\n"
+        + _SLACK_FORMATTING_BLOCK + "\n\n"
+        "When listing tickets, render each as one line.\n\n"
+        "## User assistance\n"
+        "- Be concise. After creating an issue, give the URL.\n"
+        "- If a tool fails, explain the error in plain English and suggest a fix.\n"
+        + _channel_block(channel_id)
+    )
 
-## How to pick the project (be decisive, don't over-ask)
-- candidate, candidates, profile, signup, interview, jobs, matching, resume → CANDIDATE
-- recruiter, recruiters, hiring, ATS, scraper, talent, dashboard → RECRUITER
-- If the user explicitly says a project, use it without confirming
-- If genuinely ambiguous, ask "CANDIDATE or RECRUITER?"
-{members_block}{states_block}{mixpanel_block}
-## Setting state and labels on update_work_item
-- `state` → must be a state UUID from the per-project list above, not a name. If the user says "set to Done in CANDIDATE", look up Done's UUID under CANDIDATE and pass that.
-- `labels` → must be a list of label UUIDs, not label names. We don't have a labels lookup table cached. If the user asks to add/remove labels by name, call `plane__list_labels` with the project_id first to get the UUIDs, then pass those.
-- If you can't find a matching state/label, tell the user what valid options exist; do NOT fabricate a UUID.
 
-## Assigning tickets
-- The user's message may contain emails (e.g., `rudy@remotestar.io`) — these come from Slack `@mentions` already resolved to emails.
-- For `plane__create_work_item` and update tools, the `assignees` field expects a list of Plane user_id UUIDs. Look up the email in the workspace members map above to find the UUID.
-- If you can't find a matching member, tell the user clearly: "I couldn't find a Plane user with email X — please check they're in the workspace."
-- If the user only gave a name (not email), look up by display_name in the members map; if multiple match, ask which one.
+def _build_chatbot_prompt(channel_id):
+    return (
+        "You are RemoteStar's ChatOps assistant in Slack, helping this team with their work. "
+        "The channel context below is your PRIMARY source of truth — it contains this team's playbooks, policies, and processes. "
+        "When a user asks a question, search the channel context FIRST and answer from it directly and confidently. "
+        "Do NOT say 'I don't have access to that information' if the answer is in the channel context below — read it again. "
+        "Only fall back to general knowledge if the channel context genuinely doesn't cover the topic. "
+        "You do not have Plane, GitHub, or other tool integrations in this channel, so if the user asks you to PERFORM an action that requires an external system, say so plainly.\n\n"
+        + _SLACK_FORMATTING_BLOCK + "\n"
+        + _channel_block(channel_id)
+    )
 
-## Listing and searching work items (READ THIS CAREFULLY)
-Our API key has a hard limitation: ANY filter parameter on `plane__list_work_items` (assignee_ids, state_ids, state_groups, priorities, label_ids, type_ids, cycle_ids, module_ids, created_by_ids, query, workspace_search, etc.) routes through Plane's `/work-items/advanced-search/` endpoint which returns HTTP 403 for our key. Do NOT pass any of those filters — the call will always fail.
 
-What works:
-- **`plane__list_work_items` with ONLY `project_id`** (no other filters) — returns all issues in that project. Use pagination (`per_page`, `cursor`) for large projects. **ALWAYS pass `fields="id,name,sequence_id,state,assignees"`** — without it the response includes full `description_html` for every issue and a few hundred issues will blow past the LLM context window. The `name` field is required by the MCP's schema; the others keep the payload small.
-- **`plane__search_work_items` with a `query`** — free-text workspace-wide search across name and description. Use this when the user gives a topic like "find tickets about login bug".
-- **`plane__retrieve_work_item_by_identifier`** with `project_identifier` (RECRUITER or CANDIDATE) and `issue_identifier` (the integer sequence number) — for "show me RECRUITER-106" lookups.
+def _build_mixpanel_prompt(channel_id):
+    return (
+        "You are RemoteStar's ChatOps assistant in Slack, scoped to Mixpanel analytics. "
+        "Your job is to answer product-analytics questions by calling Mixpanel MCP tools (prefixed `mixpanel__`) "
+        "until you have a real answer, then summarize it for the user in Slack. "
+        "You do NOT have Plane, GitHub, or any other integration in this channel.\n\n"
+        "## Workflow: always Discover, then Query, then Summarize\n\n"
+        "1. Discover the right project, event, and property names using `Get-Projects`, `Get-Events`, `List-Properties`.\n"
+        "2. Query to get the actual numbers using `Run-Query` (call `Get-Query-Schema` first for non-trivial queries).\n"
+        "3. Summarize in one or two Slack lines.\n\n"
+        "`Get-Projects` alone is NEVER a sufficient response. Keep going until you have a number.\n\n"
+        "## Never fabricate a refusal\n\n"
+        "The ONLY acceptable reason to refuse is a real error message from a tool you actually called. Quote it and stop.\n\n"
+        "## Date discipline\n\n"
+        "Use the current UTC timestamp from the system message for time windows.\n\n"
+        "## Project routing\n\n"
+        "- Candidate: signups, profiles, jobs, matching, resume, interview, applies → Candidate project\n"
+        "- Recruiter: recruiter dashboard, ATS flows, hiring funnel, talent search → Recruiter project\n\n"
+        "## Confirmation before destructive operations\n\n"
+        "Before any mutating tool (Delete-*, Bulk-Edit-*, Edit-Event, etc.), write a one-line summary and ask \"OK to proceed?\"\n\n"
+        "## Rate limit\n\n"
+        "Shared 600 Mixpanel requests per hour. On a 429, stop and surface the error.\n\n"
+        + _SLACK_FORMATTING_BLOCK + "\n"
+        + _channel_block(channel_id)
+    )
 
-How to handle common requests:
-- "list my tickets" / "list <user>'s tickets" / "what is assigned to X" → ALWAYS use `chatops__list_assigned_tickets`. It takes an `assignee_email` and (optionally) a `project` and returns only the matching items — server-side filtering, no token waste. Resolve `<user>` to an email first using the workspace members list above (or the requesting user's email for "my tickets").
-- "find tickets about X" → use `plane__search_work_items(query="X")`.
-- "show me RECRUITER-106" → use `plane__retrieve_work_item_by_identifier`.
-- Only fall back to `plane__list_work_items(project_id=...)` (no filters) when you genuinely need every issue in a project.
 
-Project identifiers for `retrieve_work_item_by_identifier`:
-- `RECRUITER` → recruiter project (UUID: `{settings.plane_project_recruiter}`)
-- `CANDIDATE` → candidate project (UUID: `{settings.plane_project_candidate}`)
-
-## Issue URL format (CRITICAL)
-Self-hosted Plane URL format — use this exactly, never `plane.com`:
-
-`{PLANE_HOST}/{settings.plane_workspace_slug}/projects/<PROJECT_ID>/issues/<ISSUE_ID>/`
-
-After `plane__create_work_item` succeeds, extract the new issue's id from the tool result and construct this URL.
-
-## Issue description
-For `description_html`, format as HTML with the user's content followed by an attribution footer:
-
-```html
+def build_system_prompt(channel_id, mode):
+    if mode == "chatbot":
+        return _build_chatbot_prompt(channel_id)
+    if mode == "mixpanel":
+        return _build_mixpanel_prompt(channel_id)
+    return _build_plane_prompt(channel_id)
