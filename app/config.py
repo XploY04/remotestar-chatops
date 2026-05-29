@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     slack_signing_secret: str
     slack_user_token: str | None = None
     openai_api_key: str
+    pinecone_api_key: str | None = None
     plane_api_key: str
     plane_workspace_slug: str = "remotestar"
     plane_base_url: str = "https://plane.remotestar.io/api"
