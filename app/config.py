@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     slack_user_token: str | None = None
     openai_api_key: str
     pinecone_api_key: str | None = None
+    pinecone_index: str = "remotestar-brain"        # ← ADDED
     plane_api_key: str
     plane_workspace_slug: str = "remotestar"
     plane_base_url: str = "https://plane.remotestar.io/api"
