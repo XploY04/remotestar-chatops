@@ -66,11 +66,15 @@ async def agent_loop(
     call (plane mode only). In chatbot mode, created_issue is always None.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    # ── CHANGED: extract user query + await async build_system_prompt ─────────
+    user_query = history[-1]["content"] if history else ""
     system = (
-        build_system_prompt(channel_id, mode)
+        await build_system_prompt(channel_id, mode, query=user_query)  # ← await + query
         + f"\n\n## Current request\n- User email: {user_email}"
         + f"\n- User Slack ID: {user_slack_id}\n- Timestamp: {now_iso}\n"
     )
+    # ─────────────────────────────────────────────────────────────────────────
 
     messages: list[dict] = [
         {"role": "system", "content": system},
