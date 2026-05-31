@@ -17,6 +17,7 @@ from app.instructions import (
     refresh_canvas,
     resolve_mode,
 )
+from app.memory import save_message_to_brain  # ← ADDED
 from app.plane import (
     attach_slack_files_to_plane_issue,
     looks_like_uuid,
@@ -352,7 +353,7 @@ slack_app.event("message")(ack=dm_ack, lazy=[dm_lazy])
 
 
 # ---------------------------------------------------------------------------
-# Reaction-driven status changes — only in Plane-mode channels
+# Reaction handler — Plane status changes + 🧠 Company Brain saves
 # ---------------------------------------------------------------------------
 
 
@@ -378,16 +379,43 @@ async def reaction_ack(ack):
 
 async def reaction_lazy(event, client):
     emoji = event.get("reaction")
-    target_group = EMOJI_TO_STATE_GROUP.get(emoji)
-    if not target_group:
-        return
-
     item = event.get("item") or {}
     if item.get("type") != "message":
         return
     channel = item.get("channel")
     msg_ts = item.get("ts")
     if not channel or not msg_ts:
+        return
+
+    # ── 🧠 Company Brain: save message to Pinecone ────────────────────────────
+    if emoji == "brain":
+        try:
+            history = await client.conversations_history(
+                channel=channel, latest=msg_ts, limit=1, inclusive=True
+            )
+            msgs = history.get("messages") or []
+            if msgs:
+                text = msgs[0].get("text", "").strip()
+                if text:
+                    success = await save_message_to_brain(
+                        text=text, source=f"slack:{channel}"
+                    )
+                    confirm_emoji = "white_check_mark" if success else "x"
+                    await client.reactions_add(
+                        name=confirm_emoji, channel=channel, timestamp=msg_ts
+                    )
+                    logger.info(
+                        "Brain save %s for message in %s",
+                        "succeeded" if success else "failed", channel,
+                    )
+        except Exception as e:
+            logger.warning("Brain reaction handler failed: %s", e, exc_info=True)
+        return  # done — don't fall through to Plane logic
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Plane: reaction-driven status changes ─────────────────────────────────
+    target_group = EMOJI_TO_STATE_GROUP.get(emoji)
+    if not target_group:
         return
 
     if resolve_mode(channel) != "plane":
