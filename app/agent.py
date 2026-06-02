@@ -22,20 +22,12 @@ from app.prompts import build_system_prompt
 openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
 
 
-# OpenAI chat completions caps the `tools` array at 128. Plane MCP exposes
-# 109 tools, the local LOCAL_TOOL_DEFS adds 1; that leaves 18 slots for
-# Mixpanel tools in plane mode. We pick a read-only analytics subset, since
-# mutating Mixpanel ops (Edit-Event, Delete-Dashboard, Bulk-Edit-*, etc.)
-# are out of place in a Plane ticketing channel; they remain available in
-# mixpanel-mode channels where the full 45-tool set is exposed.
 OPENAI_TOOLS_MAX = 128
 PLANE_MODE_MIXPANEL_SUBSET = frozenset({
-    # Analytics
     "mixpanel__Run-Query",
     "mixpanel__Get-Query-Schema",
     "mixpanel__Get-Report",
     "mixpanel__Display-Query",
-    # Data discovery
     "mixpanel__Get-Projects",
     "mixpanel__Get-Events",
     "mixpanel__List-Properties",
@@ -43,10 +35,8 @@ PLANE_MODE_MIXPANEL_SUBSET = frozenset({
     "mixpanel__Search-Entities",
     "mixpanel__Get-Business-Context",
     "mixpanel__Get-Issues",
-    # Metrics
     "mixpanel__List-Metrics",
     "mixpanel__Get-Metric",
-    # Dashboards (read)
     "mixpanel__List-Dashboards",
     "mixpanel__Get-Dashboard",
 })
@@ -58,29 +48,63 @@ async def agent_loop(
     user_slack_id: str,
     channel_id: str | None,
     mode: str,
+    image_data: dict | None = None,  # ← NEW: vision support
 ) -> tuple[str, dict | None]:
     """history is a list of {role, content} dicts. Last item is the current user request.
 
-    Returns (final_text, created_issue) where created_issue is
-    {project_id, issue_id} from the most recent successful plane__create/update
-    call (plane mode only). In chatbot mode, created_issue is always None.
+    image_data: optional dict with keys 'b64' (base64 string) and 'mime' (mime type).
+    When present, the last user message is sent to GPT-4o with the image attached.
+
+    Returns (final_text, created_issue).
     """
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    user_query = history[-1]["content"] if history else ""
     system = (
-        build_system_prompt(channel_id, mode)
+        await build_system_prompt(channel_id, mode, query=user_query)
         + f"\n\n## Current request\n- User email: {user_email}"
         + f"\n- User Slack ID: {user_slack_id}\n- Timestamp: {now_iso}\n"
     )
 
-    messages: list[dict] = [
-        {"role": "system", "content": system},
-        *history,
-    ]
+    # ── Build messages with optional vision content ───────────────────────────
+    if image_data and history:
+        # Replace last user message with vision-format content
+        last_text = history[-1].get("content") or "What is in this image? Describe it and answer any questions."
+        vision_message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image_data['mime']};base64,{image_data['b64']}",
+                        "detail": "high"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": last_text
+                }
+            ]
+        }
+        messages: list[dict] = [
+            {"role": "system", "content": system},
+            *history[:-1],   # all messages except last
+            vision_message,  # last message with image
+        ]
+        vision_model = "gpt-4o"  # vision requires gpt-4o not gpt-4o-mini
+        logger.info("Vision mode activated — using %s", vision_model)
+    else:
+        messages = [
+            {"role": "system", "content": system},
+            *history,
+        ]
+        vision_model = "gpt-4o-mini"
+    # ─────────────────────────────────────────────────────────────────────────
 
-    # In chatbot mode, no tools at all — single completion call, return the reply.
+    # In chatbot mode, no tools — single completion call.
     if mode == "chatbot":
         response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=vision_model,  # gpt-4o if image, gpt-4o-mini if text only
             messages=messages,
             temperature=0.7,
         )
@@ -88,21 +112,13 @@ async def agent_loop(
         await audit_log(user_slack_id, user_email, [], final)
         return final, None
 
-    # Tool-using modes:
-    #   mixpanel  → full Mixpanel toolset (45 tools). No Plane tools, so an
-    #               analytics-only channel can't create tickets by mistake.
-    #   plane     → all Plane MCP tools + local chatops__* tools + a curated
-    #               read-only subset of Mixpanel tools. The subset is required
-    #               because the union of all three (109 + 1 + 45 = 155) is past
-    #               OpenAI's 128-tool ceiling for chat completions. Mutating
-    #               Mixpanel ops are reserved for mixpanel-mode channels.
     if mode == "mixpanel":
         tools = mcp.openai_tools(server="mixpanel")
         no_tools_msg = (
             "The Mixpanel backend isn't connected right now. "
             "Try again in a moment, or ping someone to re-run OAuth bootstrap."
         )
-    else:  # plane (and any future Plane-style modes)
+    else:
         plane_tools = mcp.openai_tools(server="plane")
         mixpanel_tools = [
             t for t in mcp.openai_tools(server="mixpanel")
@@ -111,13 +127,9 @@ async def agent_loop(
         tools = plane_tools + mixpanel_tools + LOCAL_TOOL_DEFS
         no_tools_msg = "I'm not connected to any backends right now. Try again in a moment."
 
-    # Defensive: never exceed the OpenAI ceiling. If we somehow do (future
-    # tool additions, MCP version bump), log loudly and truncate rather than
-    # send a 400 to the user.
     if len(tools) > OPENAI_TOOLS_MAX:
         logger.error(
-            "Tools list exceeds OpenAI limit: have %d, max %d. Truncating. "
-            "Review PLANE_MODE_MIXPANEL_SUBSET / mode tool scoping.",
+            "Tools list exceeds OpenAI limit: have %d, max %d. Truncating.",
             len(tools), OPENAI_TOOLS_MAX,
         )
         tools = tools[:OPENAI_TOOLS_MAX]
@@ -143,7 +155,6 @@ async def agent_loop(
             await audit_log(user_slack_id, user_email, tool_call_log, final)
             return final, created_issue
 
-        # Append assistant's tool-calling message
         messages.append({
             "role": "assistant",
             "content": msg.content,
@@ -157,7 +168,6 @@ async def agent_loop(
             ],
         })
 
-        # Execute each tool call
         for tc in msg.tool_calls:
             try:
                 args = json.loads(tc.function.arguments) if tc.function.arguments else {}
@@ -174,9 +184,6 @@ async def agent_loop(
                 result = await mcp.call(tc.function.name, args)
             tool_call_log.append({"name": tc.function.name, "args": args, "result_preview": result[:200]})
 
-            # Track the issue id so we can attach files after the loop. We watch
-            # both create_work_item (new issue) and update_work_item (so files
-            # can be attached to an existing ticket via the bot). delete clears it.
             if tc.function.name == "plane__create_work_item":
                 try:
                     data = json.loads(result)

@@ -32,6 +32,7 @@ import re as _re
 import aiohttp
 from pathlib import Path
 
+from app.brain import search_brain  # ← ADDED
 from app.config import logger, settings
 
 
@@ -275,9 +276,12 @@ def resolve_mode(channel_id: str | None) -> str | None:
     return _default_mode
 
 
-def get_instructions(channel_id: str | None) -> str:
+async def get_instructions(channel_id: str | None, query: str = "") -> str:
     """Return the channel's instruction body, framed as an authoritative
-    knowledge base. Combines .md file content + live canvas content."""
+    knowledge base. Combines .md file content + live canvas content + brain search.
+
+    CHANGED: now async — pass the user's query so the brain can find relevant knowledge.
+    """
     if not channel_id:
         return ""
 
@@ -289,7 +293,13 @@ def get_instructions(channel_id: str | None) -> str:
 
     canvas_content = get_canvas_content(channel_id)
 
-    if canvas_content or md_content:
+    # ── NEW: search the Company Brain ────────────────────────────────────────
+    brain_content = ""
+    if query:
+        brain_content = await search_brain(query)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    if canvas_content or md_content or brain_content:
         parts = [
             "# Team Knowledge Base",
             "",
@@ -306,6 +316,9 @@ def get_instructions(channel_id: str | None) -> str:
             parts.append("")
             parts.append("## Live canvas content (auto-synced from Slack every hour)")
             parts.append(canvas_content)
+        if brain_content:
+            parts.append("")
+            parts.append(brain_content)  # already formatted with header
         return "\n".join(parts).strip()
 
     return md_content
