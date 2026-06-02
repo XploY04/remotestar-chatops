@@ -7,9 +7,11 @@ to a default mode)."""
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 
+import aiohttp
 from app.agent import agent_loop
 from app.config import logger, settings
 from app.instructions import (
@@ -17,7 +19,7 @@ from app.instructions import (
     refresh_canvas,
     resolve_mode,
 )
-from app.memory import save_message_to_brain  # ← ADDED
+from app.memory import save_message_to_brain
 from app.plane import (
     attach_slack_files_to_plane_issue,
     looks_like_uuid,
@@ -44,7 +46,6 @@ async def resolve_user_email(client, user_id: str) -> str:
 
 
 async def resolve_slack_mentions(client, text: str) -> str:
-    """Convert `<@U...>` Slack user mentions into emails so the LLM can map to Plane users."""
     if not text or "<@" not in text:
         return text
     user_ids = set(re.findall(r"<@([UW][A-Z0-9]+)>", text))
@@ -57,8 +58,6 @@ async def resolve_slack_mentions(client, text: str) -> str:
 
 
 def strip_bot_mention(text: str) -> str:
-    """Remove the leading <@BOT> mention from app_mention text. Only strips the first one;
-    subsequent <@USER> mentions are preserved so they can be resolved to emails."""
     if not text:
         return ""
     text = text.strip()
@@ -84,7 +83,6 @@ async def get_bot_user_id(client) -> str:
 
 
 async def collect_thread_files(client, channel: str, thread_ts: str, limit: int = 30) -> list[dict]:
-    """Scan a thread for any uploaded files (skipping the bot's own messages)."""
     try:
         result = await client.conversations_replies(channel=channel, ts=thread_ts, limit=limit)
         if not result.get("ok"):
@@ -103,7 +101,6 @@ async def collect_thread_files(client, channel: str, thread_ts: str, limit: int 
 
 
 async def fetch_thread_history(client, channel: str, thread_ts: str, limit: int = 30) -> list[dict]:
-    """Fetch messages in a thread and convert to LLM message format."""
     try:
         result = await client.conversations_replies(channel=channel, ts=thread_ts, limit=limit)
         if not result.get("ok"):
@@ -125,6 +122,32 @@ async def fetch_thread_history(client, channel: str, thread_ts: str, limit: int 
 
 
 # ---------------------------------------------------------------------------
+# Vision helper — download Slack image as base64
+# ---------------------------------------------------------------------------
+
+
+async def download_image_as_base64(file_url: str, bot_token: str) -> tuple[str, str] | None:
+    """Download a Slack image and return (base64_data, mime_type). Returns None on failure."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                file_url,
+                headers={"Authorization": f"Bearer {bot_token}"}
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("Image download failed: HTTP %s", resp.status)
+                    return None
+                data = await resp.read()
+                mime_type = resp.content_type or "image/png"
+                b64 = base64.b64encode(data).decode("utf-8")
+                logger.info("Image downloaded for vision: %d bytes, mime=%s", len(data), mime_type)
+                return b64, mime_type
+    except Exception as e:
+        logger.warning("Image download exception: %s", e, exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Shared agent flow for both @mentions and DMs
 # ---------------------------------------------------------------------------
 
@@ -140,17 +163,29 @@ async def handle_user_request(
     reply_ts: str | None,
     mode: str,
 ) -> None:
-    # Help short-circuit — deterministic, no LLM cost. Tool-using modes only;
-    # in chatbot mode the channel's persona answers "help" in-character.
     if mode in ("plane", "mixpanel") and is_help_text(text) and not files:
         await client.chat_postMessage(channel=channel, thread_ts=reply_ts, text=help_text_for(mode))
         return
 
     text = await resolve_slack_mentions(client, text)
 
-    # In Plane mode, if files came in, hint the LLM so it knows to create an issue.
-    # In chatbot mode, files are silently ignored — V1 has no vision/upload there.
-    if files and mode == "plane":
+    # ── Vision: detect image and download as base64 ───────────────────────────
+    image_data: dict | None = None
+    if files:
+        for f in files:
+            mime = f.get("mimetype", "")
+            if mime.startswith("image/"):
+                url = f.get("url_private_download") or f.get("url_private")
+                if url:
+                    result = await download_image_as_base64(url, settings.slack_bot_token)
+                    if result:
+                        image_data = {"b64": result[0], "mime": result[1]}
+                        logger.info("Vision image ready: %s", f.get("name"))
+                        break  # only first image
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Plane file hint — only for non-image files
+    if files and mode == "plane" and not image_data:
         names = ", ".join(f.get("name") or "file" for f in files)
         text = (text or "Create a ticket for this.") + (
             f"\n\n[The user attached {len(files)} file(s) in Slack: {names}. "
@@ -169,13 +204,18 @@ async def handle_user_request(
     email = await resolve_user_email(client, user_id)
     created_issue: dict | None = None
     try:
-        result, created_issue = await agent_loop(history, email, user_id, channel_id=channel, mode=mode)
+        result, created_issue = await agent_loop(
+            history, email, user_id,
+            channel_id=channel,
+            mode=mode,
+            image_data=image_data,  # ← vision support
+        )
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
 
-    # Attachments: only in plane mode.
-    if files and mode == "plane":
+    # Attachments: plane mode, non-image files only
+    if files and mode == "plane" and not image_data:
         if (
             created_issue
             and looks_like_uuid(created_issue.get("issue_id"))
@@ -266,7 +306,6 @@ async def mention_lazy(event, client):
         return
 
     reply_ts = event.get("thread_ts") or event["ts"]
-
     text = strip_bot_mention(event.get("text", "") or "")
     files = event.get("files") or []
 
@@ -304,7 +343,7 @@ slack_app.event("app_mention")(ack=mention_ack, lazy=[mention_lazy])
 
 
 # ---------------------------------------------------------------------------
-# DM handler — `message` event filtered to channel_type=im
+# DM handler
 # ---------------------------------------------------------------------------
 
 
@@ -324,7 +363,7 @@ async def dm_lazy(event, client):
     channel = event["channel"]
     mode = resolve_mode(channel)
     if mode is None:
-        logger.info("DM mode not configured (no instructions/{plane,chatbot}/dm.md) — ignoring")
+        logger.info("DM mode not configured — ignoring")
         return
 
     text = (event.get("text") or "").strip()
@@ -387,7 +426,7 @@ async def reaction_lazy(event, client):
     if not channel or not msg_ts:
         return
 
-    # ── 🧠 Company Brain: save message to Pinecone ────────────────────────────
+    # 🧠 Company Brain
     if emoji == "brain":
         try:
             history = await client.conversations_history(
@@ -397,34 +436,23 @@ async def reaction_lazy(event, client):
             if msgs:
                 text = msgs[0].get("text", "").strip()
                 if text:
-                    success = await save_message_to_brain(
-                        text=text, source=f"slack:{channel}"
-                    )
+                    success = await save_message_to_brain(text=text, source=f"slack:{channel}")
                     confirm_emoji = "white_check_mark" if success else "x"
-                    await client.reactions_add(
-                        name=confirm_emoji, channel=channel, timestamp=msg_ts
-                    )
-                    logger.info(
-                        "Brain save %s for message in %s",
-                        "succeeded" if success else "failed", channel,
-                    )
+                    await client.reactions_add(name=confirm_emoji, channel=channel, timestamp=msg_ts)
+                    logger.info("Brain save %s for message in %s", "succeeded" if success else "failed", channel)
         except Exception as e:
             logger.warning("Brain reaction handler failed: %s", e, exc_info=True)
-        return  # done — don't fall through to Plane logic
-    # ─────────────────────────────────────────────────────────────────────────
+        return
 
-    # ── Plane: reaction-driven status changes ─────────────────────────────────
+    # Plane status changes
     target_group = EMOJI_TO_STATE_GROUP.get(emoji)
     if not target_group:
         return
-
     if resolve_mode(channel) != "plane":
         return
 
     try:
-        history = await client.conversations_history(
-            channel=channel, latest=msg_ts, limit=1, inclusive=True
-        )
+        history = await client.conversations_history(channel=channel, latest=msg_ts, limit=1, inclusive=True)
         msgs = history.get("messages") or []
         if not msgs:
             return
@@ -448,23 +476,12 @@ async def reaction_lazy(event, client):
         logger.warning("No %s state cached for project %s", target_group, project_id)
         return
 
-    logger.info(
-        "Reaction :%s: from %s -> set state group %s on %s/%s",
-        emoji, event.get("user"), target_group, project_id, issue_id,
-    )
-    result = await mcp.call("plane__update_work_item", {
-        "project_id": project_id,
-        "work_item_id": issue_id,
-        "state": state_id,
-    })
+    logger.info("Reaction :%s: from %s -> set state group %s on %s/%s", emoji, event.get("user"), target_group, project_id, issue_id)
+    result = await mcp.call("plane__update_work_item", {"project_id": project_id, "work_item_id": issue_id, "state": state_id})
     state_name = (plane_states_cache.get(state_id) or {}).get("name") or target_group
     try:
         json.loads(result)
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=msg_ts,
-            text=f"Marked as *{state_name}* via :{emoji}: from <@{event.get('user')}>.",
-        )
+        await client.chat_postMessage(channel=channel, thread_ts=msg_ts, text=f"Marked as *{state_name}* via :{emoji}: from <@{event.get('user')}>.")
     except (json.JSONDecodeError, TypeError):
         logger.warning("update_work_item returned unexpected result: %s", result[:200])
 
@@ -473,7 +490,7 @@ slack_app.event("reaction_added")(ack=reaction_ack, lazy=[reaction_lazy])
 
 
 # ---------------------------------------------------------------------------
-# Canvas update handler — real-time canvas sync
+# Canvas update handler
 # ---------------------------------------------------------------------------
 
 
@@ -482,27 +499,18 @@ async def canvas_ack(ack):
 
 
 async def canvas_lazy(event, client):
-    """Re-fetch canvas content when a Slack canvas is updated."""
     canvas_id = event.get("canvas_id")
     if not canvas_id:
         return
-
     channel_id = get_channel_id_for_canvas(canvas_id)
     if not channel_id:
-        logger.info(
-            "Canvas %s updated but not mapped to any channel — ignoring", canvas_id
-        )
+        logger.info("Canvas %s updated but not mapped to any channel — ignoring", canvas_id)
         return
-
-    logger.info(
-        "Canvas %s updated — refreshing context for channel %s", canvas_id, channel_id
-    )
+    logger.info("Canvas %s updated — refreshing context for channel %s", canvas_id, channel_id)
     try:
         await refresh_canvas(channel_id, settings.slack_bot_token)
     except Exception as e:
-        logger.warning(
-            "Failed to refresh canvas %s for channel %s: %s", canvas_id, channel_id, e
-        )
+        logger.warning("Failed to refresh canvas %s for channel %s: %s", canvas_id, channel_id, e)
 
 
 slack_app.event("canvas_updated")(ack=canvas_ack, lazy=[canvas_lazy])
