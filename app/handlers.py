@@ -1,9 +1,5 @@
 """Slack listeners: app_mention, message (DM), slash command, reaction_added,
-canvas_updated.
-
-Mode is resolved per request via app.instructions.resolve_mode(channel). If a
-channel has no instructions file, the bot drops the event silently (no fallback
-to a default mode)."""
+canvas_updated."""
 
 from __future__ import annotations
 
@@ -19,7 +15,6 @@ from app.instructions import (
     refresh_canvas,
     resolve_mode,
 )
-from app.memory import save_message_to_brain
 from app.plane import (
     attach_slack_files_to_plane_issue,
     looks_like_uuid,
@@ -29,11 +24,6 @@ from app.plane import (
 )
 from app.prompts import help_text_for, is_help_text, to_slack_mrkdwn
 from app.slack_app import slack_app
-
-
-# ---------------------------------------------------------------------------
-# Small Slack helpers
-# ---------------------------------------------------------------------------
 
 
 async def resolve_user_email(client, user_id: str) -> str:
@@ -121,13 +111,7 @@ async def fetch_thread_history(client, channel: str, thread_ts: str, limit: int 
         return []
 
 
-# ---------------------------------------------------------------------------
-# Vision helper — download Slack image as base64
-# ---------------------------------------------------------------------------
-
-
 async def download_image_as_base64(file_url: str, bot_token: str) -> tuple[str, str] | None:
-    """Download a Slack image and return (base64_data, mime_type). Returns None on failure."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -140,16 +124,10 @@ async def download_image_as_base64(file_url: str, bot_token: str) -> tuple[str, 
                 data = await resp.read()
                 mime_type = resp.content_type or "image/png"
                 b64 = base64.b64encode(data).decode("utf-8")
-                logger.info("Image downloaded for vision: %d bytes, mime=%s", len(data), mime_type)
                 return b64, mime_type
     except Exception as e:
         logger.warning("Image download exception: %s", e, exc_info=True)
         return None
-
-
-# ---------------------------------------------------------------------------
-# Shared agent flow for both @mentions and DMs
-# ---------------------------------------------------------------------------
 
 
 async def handle_user_request(
@@ -169,7 +147,7 @@ async def handle_user_request(
 
     text = await resolve_slack_mentions(client, text)
 
-    # ── Vision: detect image and download as base64 ───────────────────────────
+    # Vision: detect image and download as base64
     image_data: dict | None = None
     if files:
         for f in files:
@@ -181,10 +159,8 @@ async def handle_user_request(
                     if result:
                         image_data = {"b64": result[0], "mime": result[1]}
                         logger.info("Vision image ready: %s", f.get("name"))
-                        break  # only first image
-    # ─────────────────────────────────────────────────────────────────────────
+                        break
 
-    # Plane file hint — only for non-image files
     if files and mode == "plane" and not image_data:
         names = ", ".join(f.get("name") or "file" for f in files)
         text = (text or "Create a ticket for this.") + (
@@ -208,13 +184,12 @@ async def handle_user_request(
             history, email, user_id,
             channel_id=channel,
             mode=mode,
-            image_data=image_data,  # ← vision support
+            image_data=image_data,
         )
     except Exception as e:
         logger.error("Agent failed: %s", e, exc_info=True)
         result = f"Something went wrong: {e}"
 
-    # Attachments: plane mode, non-image files only
     if files and mode == "plane" and not image_data:
         if (
             created_issue
@@ -246,11 +221,6 @@ async def handle_user_request(
     )
 
 
-# ---------------------------------------------------------------------------
-# Slash command — /cs
-# ---------------------------------------------------------------------------
-
-
 async def slash_ack(ack):
     await ack()
 
@@ -267,11 +237,9 @@ async def slash_lazy(command, respond, client):
         return
     text = await resolve_slack_mentions(client, text)
     email = await resolve_user_email(client, command["user_id"])
-
     if mode in ("plane", "mixpanel") and is_help_text(text):
         await respond(text=help_text_for(mode), response_type="ephemeral")
         return
-
     try:
         result, _created = await agent_loop(
             [{"role": "user", "content": text}],
@@ -289,11 +257,6 @@ async def slash_lazy(command, respond, client):
 slack_app.command("/cs")(ack=slash_ack, lazy=[slash_lazy])
 
 
-# ---------------------------------------------------------------------------
-# @-mention handler
-# ---------------------------------------------------------------------------
-
-
 async def mention_ack(ack):
     await ack()
 
@@ -304,47 +267,24 @@ async def mention_lazy(event, client):
     if mode is None:
         logger.info("Mention in unconfigured channel %s — ignoring", channel)
         return
-
     reply_ts = event.get("thread_ts") or event["ts"]
     text = strip_bot_mention(event.get("text", "") or "")
     files = event.get("files") or []
-
     if mode == "plane" and not files and event.get("thread_ts"):
         files = await collect_thread_files(client, channel, event["thread_ts"])
         if files:
             logger.info("Collected %d file(s) from thread context", len(files))
-
-    logger.info(
-        "Mention received: user=%s channel=%s mode=%s text=%r files=%d",
-        event.get("user"), channel, mode, text[:120], len(files),
-    )
-
+    logger.info("Mention received: user=%s channel=%s mode=%s text=%r files=%d",
+        event.get("user"), channel, mode, text[:120], len(files))
     if not text and not files:
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=reply_ts,
-            text="Mention me with an instruction. Try `@chatops help`.",
-        )
+        await client.chat_postMessage(channel=channel, thread_ts=reply_ts,
+            text="Mention me with an instruction. Try `@chatops help`.")
         return
-
-    await handle_user_request(
-        client,
-        channel=channel,
-        user_id=event["user"],
-        text=text,
-        files=files,
-        thread_ts=event.get("thread_ts"),
-        reply_ts=reply_ts,
-        mode=mode,
-    )
+    await handle_user_request(client, channel=channel, user_id=event["user"],
+        text=text, files=files, thread_ts=event.get("thread_ts"), reply_ts=reply_ts, mode=mode)
 
 
 slack_app.event("app_mention")(ack=mention_ack, lazy=[mention_lazy])
-
-
-# ---------------------------------------------------------------------------
-# DM handler
-# ---------------------------------------------------------------------------
 
 
 async def dm_ack(ack):
@@ -359,41 +299,23 @@ async def dm_lazy(event, client):
     bot_uid = await get_bot_user_id(client)
     if event.get("user") == bot_uid:
         return
-
     channel = event["channel"]
     mode = resolve_mode(channel)
     if mode is None:
         logger.info("DM mode not configured — ignoring")
         return
-
     text = (event.get("text") or "").strip()
     files = event.get("files") or []
     if not text and not files:
         return
-
-    logger.info(
-        "DM received: user=%s mode=%s text=%r files=%d",
-        event.get("user"), mode, text[:120], len(files),
-    )
-
-    await handle_user_request(
-        client,
-        channel=channel,
-        user_id=event["user"],
-        text=text,
-        files=files,
-        thread_ts=event.get("thread_ts"),
-        reply_ts=event.get("thread_ts"),
-        mode=mode,
-    )
+    logger.info("DM received: user=%s mode=%s text=%r files=%d",
+        event.get("user"), mode, text[:120], len(files))
+    await handle_user_request(client, channel=channel, user_id=event["user"],
+        text=text, files=files, thread_ts=event.get("thread_ts"),
+        reply_ts=event.get("thread_ts"), mode=mode)
 
 
 slack_app.event("message")(ack=dm_ack, lazy=[dm_lazy])
-
-
-# ---------------------------------------------------------------------------
-# Reaction handler — Plane status changes + 🧠 Company Brain saves
-# ---------------------------------------------------------------------------
 
 
 EMOJI_TO_STATE_GROUP: dict[str, str] = {
@@ -426,31 +348,12 @@ async def reaction_lazy(event, client):
     if not channel or not msg_ts:
         return
 
-    # 🧠 Company Brain
-    if emoji == "brain":
-        try:
-            history = await client.conversations_history(
-                channel=channel, latest=msg_ts, limit=1, inclusive=True
-            )
-            msgs = history.get("messages") or []
-            if msgs:
-                text = msgs[0].get("text", "").strip()
-                if text:
-                    success = await save_message_to_brain(text=text, source=f"slack:{channel}")
-                    confirm_emoji = "white_check_mark" if success else "x"
-                    await client.reactions_add(name=confirm_emoji, channel=channel, timestamp=msg_ts)
-                    logger.info("Brain save %s for message in %s", "succeeded" if success else "failed", channel)
-        except Exception as e:
-            logger.warning("Brain reaction handler failed: %s", e, exc_info=True)
-        return
-
-    # Plane status changes
+    # Plane status changes only — brain removed
     target_group = EMOJI_TO_STATE_GROUP.get(emoji)
     if not target_group:
         return
     if resolve_mode(channel) != "plane":
         return
-
     try:
         history = await client.conversations_history(channel=channel, latest=msg_ts, limit=1, inclusive=True)
         msgs = history.get("messages") or []
@@ -460,38 +363,29 @@ async def reaction_lazy(event, client):
     except Exception as e:
         logger.warning("Could not fetch reacted message: %s", e)
         return
-
     bot_uid = await get_bot_user_id(client)
     if msg.get("user") != bot_uid and not msg.get("bot_id"):
         return
-
     text = msg.get("text") or ""
     m = _ISSUE_URL_RE.search(text)
     if not m:
         return
     project_id, issue_id = m.group(1), m.group(2)
-
     state_id = pick_state_for_group(project_id, target_group)
     if not state_id:
         logger.warning("No %s state cached for project %s", target_group, project_id)
         return
-
-    logger.info("Reaction :%s: from %s -> set state group %s on %s/%s", emoji, event.get("user"), target_group, project_id, issue_id)
     result = await mcp.call("plane__update_work_item", {"project_id": project_id, "work_item_id": issue_id, "state": state_id})
     state_name = (plane_states_cache.get(state_id) or {}).get("name") or target_group
     try:
         json.loads(result)
-        await client.chat_postMessage(channel=channel, thread_ts=msg_ts, text=f"Marked as *{state_name}* via :{emoji}: from <@{event.get('user')}>.")
+        await client.chat_postMessage(channel=channel, thread_ts=msg_ts,
+            text=f"Marked as *{state_name}* via :{emoji}: from <@{event.get('user')}>.")
     except (json.JSONDecodeError, TypeError):
         logger.warning("update_work_item returned unexpected result: %s", result[:200])
 
 
 slack_app.event("reaction_added")(ack=reaction_ack, lazy=[reaction_lazy])
-
-
-# ---------------------------------------------------------------------------
-# Canvas update handler
-# ---------------------------------------------------------------------------
 
 
 async def canvas_ack(ack):
