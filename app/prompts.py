@@ -246,7 +246,9 @@ def _build_chatbot_prompt(channel_id):
         "The channel context below is your PRIMARY source of truth — it contains this team's playbooks, policies, and processes. "
         "When a user asks a question, search the channel context FIRST and answer from it directly and confidently. "
         "Do NOT say 'I don't have access to that information' if the answer is in the channel context below — read it again. "
-        "Only fall back to general knowledge if the channel context genuinely doesn't cover the topic. "
+        "If the topic is NOT covered in the channel context, do NOT answer immediately. "
+        "Instead respond with exactly: 'This is not in our playbook or canvas. Would you like me to answer from my general knowledge?' "
+        "Only answer from general knowledge if the user explicitly says yes. "
         "You do not have Plane, GitHub, or other tool integrations in this channel, so if the user asks you to PERFORM an action that requires an external system, say so plainly.\n\n"
         + _SLACK_FORMATTING_BLOCK + "\n"
         + _channel_block(channel_id)
