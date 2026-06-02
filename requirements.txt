@@ -9,4 +9,4 @@ pydantic==2.10.2
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
 motor==3.7.1
-pinecone-client>=3.0.0
+pinecone>=3.0.0
