@@ -1,7 +1,6 @@
 """LLM tool-calling loop. Mode-aware:
 - "plane":    Plane MCP toolset + chatops__* local tools + a curated read-only
-              subset of Mixpanel tools (so plane channels can answer analytics
-              questions without exceeding OpenAI's 128-tool array limit).
+              subset of Mixpanel tools.
 - "mixpanel": full Mixpanel MCP toolset (45 tools), no Plane.
 - "chatbot":  no tools, single completion call.
 """
@@ -20,7 +19,6 @@ from app.prompts import build_system_prompt
 
 
 openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
-
 
 OPENAI_TOOLS_MAX = 128
 PLANE_MODE_MIXPANEL_SUBSET = frozenset({
@@ -48,27 +46,22 @@ async def agent_loop(
     user_slack_id: str,
     channel_id: str | None,
     mode: str,
-    image_data: dict | None = None,  # ← NEW: vision support
+    image_data: dict | None = None,  # vision support
 ) -> tuple[str, dict | None]:
     """history is a list of {role, content} dicts. Last item is the current user request.
 
-    image_data: optional dict with keys 'b64' (base64 string) and 'mime' (mime type).
+    image_data: optional dict with keys 'b64' (base64) and 'mime' (mime type).
     When present, the last user message is sent to GPT-4o with the image attached.
-
-    Returns (final_text, created_issue).
     """
     now_iso = datetime.now(timezone.utc).isoformat()
-
-    user_query = history[-1]["content"] if history else ""
     system = (
-        await build_system_prompt(channel_id, mode, query=user_query)
+        build_system_prompt(channel_id, mode)
         + f"\n\n## Current request\n- User email: {user_email}"
         + f"\n- User Slack ID: {user_slack_id}\n- Timestamp: {now_iso}\n"
     )
 
-    # ── Build messages with optional vision content ───────────────────────────
+    # ── Build messages with optional vision ───────────────────────────────────
     if image_data and history:
-        # Replace last user message with vision-format content
         last_text = history[-1].get("content") or "What is in this image? Describe it and answer any questions."
         vision_message = {
             "role": "user",
@@ -88,10 +81,10 @@ async def agent_loop(
         }
         messages: list[dict] = [
             {"role": "system", "content": system},
-            *history[:-1],   # all messages except last
-            vision_message,  # last message with image
+            *history[:-1],
+            vision_message,
         ]
-        vision_model = "gpt-4o"  # vision requires gpt-4o not gpt-4o-mini
+        vision_model = "gpt-4o"
         logger.info("Vision mode activated — using %s", vision_model)
     else:
         messages = [
@@ -101,10 +94,10 @@ async def agent_loop(
         vision_model = "gpt-4o-mini"
     # ─────────────────────────────────────────────────────────────────────────
 
-    # In chatbot mode, no tools — single completion call.
+    # Chatbot mode — no tools
     if mode == "chatbot":
         response = await openai_client.chat.completions.create(
-            model=vision_model,  # gpt-4o if image, gpt-4o-mini if text only
+            model=vision_model,
             messages=messages,
             temperature=0.7,
         )

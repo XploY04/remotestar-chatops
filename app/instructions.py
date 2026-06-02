@@ -32,7 +32,6 @@ import re as _re
 import aiohttp
 from pathlib import Path
 
-from app.brain import search_brain  # ← ADDED
 from app.config import logger, settings
 
 
@@ -75,12 +74,10 @@ _canvas_cache: dict[str, list[tuple[str, str]]] = {
 
 async def fetch_canvas_content(canvas_id: str, bot_token: str) -> str:
     """Fetch canvas content by downloading the raw HTML and stripping tags."""
-    # Prefer user token for canvas access
     token = settings.slack_user_token or bot_token
 
     try:
         async with aiohttp.ClientSession() as session:
-            # Step 1: Get the download URL via files.info
             async with session.get(
                 "https://slack.com/api/files.info",
                 headers={"Authorization": f"Bearer {token}"},
@@ -97,7 +94,6 @@ async def fetch_canvas_content(canvas_id: str, bot_token: str) -> str:
                     logger.warning("Canvas %s has no download URL", canvas_id)
                     return ""
 
-            # Step 2: Download the raw HTML content
             async with session.get(
                 download_url,
                 headers={"Authorization": f"Bearer {token}"},
@@ -109,7 +105,6 @@ async def fetch_canvas_content(canvas_id: str, bot_token: str) -> str:
                     return ""
                 html = await resp.text()
 
-        # Step 3: Strip HTML tags to get plain text
         text = _re.sub(r"<[^>]+>", " ", html)
         text = _re.sub(r"\s+", " ", text).strip()
         return text
@@ -276,12 +271,9 @@ def resolve_mode(channel_id: str | None) -> str | None:
     return _default_mode
 
 
-async def get_instructions(channel_id: str | None, query: str = "") -> str:
+def get_instructions(channel_id: str | None) -> str:
     """Return the channel's instruction body, framed as an authoritative
-    knowledge base. Combines .md file content + live canvas content + brain search.
-
-    CHANGED: now async — pass the user's query so the brain can find relevant knowledge.
-    """
+    knowledge base. Combines .md file content + live canvas content."""
     if not channel_id:
         return ""
 
@@ -293,13 +285,7 @@ async def get_instructions(channel_id: str | None, query: str = "") -> str:
 
     canvas_content = get_canvas_content(channel_id)
 
-    # ── NEW: search the Company Brain ────────────────────────────────────────
-    brain_content = ""
-    if query:
-        brain_content = await search_brain(query)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    if canvas_content or md_content or brain_content:
+    if canvas_content or md_content:
         parts = [
             "# Team Knowledge Base",
             "",
@@ -316,9 +302,6 @@ async def get_instructions(channel_id: str | None, query: str = "") -> str:
             parts.append("")
             parts.append("## Live canvas content (auto-synced from Slack every hour)")
             parts.append(canvas_content)
-        if brain_content:
-            parts.append("")
-            parts.append(brain_content)  # already formatted with header
         return "\n".join(parts).strip()
 
     return md_content

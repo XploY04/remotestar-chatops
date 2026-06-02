@@ -31,9 +31,8 @@ HELP_TEXT_PLANE = """*RemoteStar ChatOps* — what I can do here:
 - :back: → move to Backlog
 - :x: → mark Cancelled
 
-*Company Brain*
-- React with :brain: on any message → I'll save it to the team knowledge base
-- Then ask me anything — I'll search the brain automatically and answer from it
+*Vision*
+- Share any screenshot + mention me with a question → I'll read the image and answer
 """
 
 
@@ -45,10 +44,9 @@ Examples:
 - `@chatops draft three subject lines for our launch email`
 - `@chatops summarize what's been said in this thread`
 - `@chatops what's the right tone for a Series A announcement vs a feature drop?`
-- `@chatops what is our BD strategy?` ← searches the Company Brain automatically
 
-*Company Brain*
-- React with :brain: on any message → I'll save it to the team knowledge base
+*Vision*
+- Share any screenshot + mention me → I'll read and answer based on what I see
 """
 
 
@@ -105,11 +103,8 @@ Slack uses its own variant of markdown. Output your replies in that syntax — n
 - Strikethrough: `~text~`."""
 
 
-async def _channel_block(channel_id: str | None, query: str = "") -> str:
-    """Async — fetches instructions + brain search results for the channel."""
-    if not channel_id:
-        return ""
-    body = (await get_instructions(channel_id, query=query)).strip()  # ← CHANGED: now async + passes query
+def _channel_block(channel_id):
+    body = get_instructions(channel_id).strip() if channel_id else ""
     if not body:
         return ""
     return (
@@ -119,7 +114,7 @@ async def _channel_block(channel_id: str | None, query: str = "") -> str:
     )
 
 
-def _build_plane_prompt(channel_id, channel_block: str = "") -> str:
+def _build_plane_prompt(channel_id):
     members_block = ""
     if plane_members_cache:
         rows = "\n".join(
@@ -241,11 +236,11 @@ def _build_plane_prompt(channel_id, channel_block: str = "") -> str:
         "## User assistance\n"
         "- Be concise. After creating an issue, give the URL.\n"
         "- If a tool fails, explain the error in plain English and suggest a fix.\n"
-        + channel_block
+        + _channel_block(channel_id)
     )
 
 
-def _build_chatbot_prompt(channel_id, channel_block: str = "") -> str:
+def _build_chatbot_prompt(channel_id):
     return (
         "You are RemoteStar's ChatOps assistant in Slack, helping this team with their work. "
         "The channel context below is your PRIMARY source of truth — it contains this team's playbooks, policies, and processes. "
@@ -254,11 +249,11 @@ def _build_chatbot_prompt(channel_id, channel_block: str = "") -> str:
         "Only fall back to general knowledge if the channel context genuinely doesn't cover the topic. "
         "You do not have Plane, GitHub, or other tool integrations in this channel, so if the user asks you to PERFORM an action that requires an external system, say so plainly.\n\n"
         + _SLACK_FORMATTING_BLOCK + "\n"
-        + channel_block
+        + _channel_block(channel_id)
     )
 
 
-def _build_mixpanel_prompt(channel_id, channel_block: str = "") -> str:
+def _build_mixpanel_prompt(channel_id):
     return (
         "You are RemoteStar's ChatOps assistant in Slack, scoped to Mixpanel analytics. "
         "Your job is to answer product-analytics questions by calling Mixpanel MCP tools (prefixed `mixpanel__`) "
@@ -281,15 +276,13 @@ def _build_mixpanel_prompt(channel_id, channel_block: str = "") -> str:
         "## Rate limit\n\n"
         "Shared 600 Mixpanel requests per hour. On a 429, stop and surface the error.\n\n"
         + _SLACK_FORMATTING_BLOCK + "\n"
-        + channel_block
+        + _channel_block(channel_id)
     )
 
 
-async def build_system_prompt(channel_id: str | None, mode: str, query: str = "") -> str:
-    """CHANGED: now async — fetches brain search results alongside canvas/instructions."""
-    cb = await _channel_block(channel_id, query=query)
+def build_system_prompt(channel_id, mode):
     if mode == "chatbot":
-        return _build_chatbot_prompt(channel_id, channel_block=cb)
+        return _build_chatbot_prompt(channel_id)
     if mode == "mixpanel":
-        return _build_mixpanel_prompt(channel_id, channel_block=cb)
-    return _build_plane_prompt(channel_id, channel_block=cb)
+        return _build_mixpanel_prompt(channel_id)
+    return _build_plane_prompt(channel_id)
