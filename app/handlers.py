@@ -353,6 +353,10 @@ async def reaction_lazy(event, client):
 
     # 🧠 Company Brain — send to n8n webhook
     if emoji == "brain":
+        # Ignore reactions from the bot itself to prevent duplicates
+        bot_uid = await get_bot_user_id(client)
+        if event.get("user") == bot_uid:
+            return
         try:
             history = await client.conversations_history(
                 channel=channel, latest=msg_ts, limit=1, inclusive=True
