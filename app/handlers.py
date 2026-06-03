@@ -257,6 +257,49 @@ async def slash_lazy(command, respond, client):
 slack_app.command("/cs")(ack=slash_ack, lazy=[slash_lazy])
 
 
+
+async def handle_recap_request(client, *, channel: str, days: int, reply_ts: str) -> None:
+    import time
+    import openai
+    oldest = str(time.time() - days * 24 * 60 * 60)
+    try:
+        result = await client.conversations_history(channel=channel, oldest=oldest, limit=500)
+        msgs = result.get("messages") or []
+        lines = []
+        for m in reversed(msgs):
+            if m.get("bot_id") or m.get("subtype"):
+                continue
+            msg_text = (m.get("text") or "").strip()
+            if msg_text:
+                lines.append(msg_text)
+        if not lines:
+            await client.chat_postMessage(channel=channel, thread_ts=reply_ts,
+                text=f"No messages found in the last {days} days.")
+            return
+        full_text = "\n".join(lines)
+        prompt = (
+            "Here are the last " + str(days) + " days of messages from a Slack channel.\n"
+            "Summarize the key highlights in clear bullet points. Be concise.\n\n"
+            + full_text[:12000]
+        )
+        oai = openai.AsyncOpenAI()
+        response = await oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=800,
+        )
+        summary = response.choices[0].message.content
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=reply_ts,
+            text=":brain: *Last " + str(days) + " days recap:*\n\n" + summary
+        )
+    except Exception as e:
+        logger.warning("Recap request failed: %s", e, exc_info=True)
+        await client.chat_postMessage(channel=channel, thread_ts=reply_ts,
+            text="Sorry, failed to generate recap: " + str(e))
+
+
 async def mention_ack(ack):
     await ack()
 
@@ -280,6 +323,24 @@ async def mention_lazy(event, client):
         await client.chat_postMessage(channel=channel, thread_ts=reply_ts,
             text="Mention me with an instruction. Try `@chatops help`.")
         return
+
+    # Recap intent — ask user for time range
+    recap_keywords = ["recap", "summarize", "summary", "what happened", "last week", "catch me up"]
+    if any(kw in text.lower() for kw in recap_keywords) and "days" not in text.lower():
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=reply_ts,
+            text="Sure! Would you like a recap for the last *7 days*, *10 days*, or *20 days*? Just reply with the number."
+        )
+        return
+
+    # User replied with a number of days for recap
+    days_match = re.search(r"\b(7|10|20)\b", text)
+    if days_match and event.get("thread_ts"):
+        days = int(days_match.group(1))
+        await handle_recap_request(client, channel=channel, days=days, reply_ts=reply_ts)
+        return
+
     await handle_user_request(client, channel=channel, user_id=event["user"],
         text=text, files=files, thread_ts=event.get("thread_ts"), reply_ts=reply_ts, mode=mode)
 
@@ -353,20 +414,38 @@ async def reaction_lazy(event, client):
 
     # 🧠 Company Brain — send to n8n webhook
     if emoji == "brain":
+        # Ignore reactions from the bot itself to prevent duplicates
+        bot_uid = await get_bot_user_id(client)
+        if event.get("user") == bot_uid:
+            return
         try:
+            import time
+            oldest = str(time.time() - 20 * 24 * 60 * 60)  # 20 days ago
             history = await client.conversations_history(
-                channel=channel, latest=msg_ts, limit=1, inclusive=True
+                channel=channel, oldest=oldest, limit=500
             )
             msgs = history.get("messages") or []
-            if msgs:
-                text = msgs[0].get("text", "").strip()
+            # Filter out bot messages and empty texts
+            lines = []
+            for m in reversed(msgs):  # oldest first
+                if m.get("bot_id") or m.get("subtype"):
+                    continue
+                text = (m.get("text") or "").strip()
                 if text:
-                    async with aiohttp.ClientSession() as session:
-                        await session.post(
-                            BRAIN_WEBHOOK_URL,
-                            json={"text": text, "channel": channel, "ts": msg_ts}
-                        )
-                    logger.info("Sent message to Company Brain n8n webhook")
+                    lines.append(text)
+            if lines:
+                full_text = "\n".join(lines)
+                async with aiohttp.ClientSession() as session:
+                    await session.post(
+                        BRAIN_WEBHOOK_URL,
+                        json={"text": full_text, "channel": channel, "ts": msg_ts}
+                    )
+                logger.info("Sent last 20 days (%d messages) to Company Brain n8n webhook", len(lines))
+                # Confirm to the user
+                await client.chat_postMessage(
+                    channel=channel,
+                    text=f"🧠 Saving last 20 days of this channel to Company Brain... ({len(lines)} messages)"
+                )
         except Exception as e:
             logger.warning("Brain webhook failed: %s", e, exc_info=True)
         return
