@@ -333,6 +333,9 @@ _ISSUE_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# n8n Company Brain webhook URL
+BRAIN_WEBHOOK_URL = "https://aadi1974.app.n8n.cloud/webhook/1ad2e233-fc45-4d22-93da-dd2fdff4acaa"
+
 
 async def reaction_ack(ack):
     await ack()
@@ -348,7 +351,27 @@ async def reaction_lazy(event, client):
     if not channel or not msg_ts:
         return
 
-    # Plane status changes only — brain removed
+    # 🧠 Company Brain — send to n8n webhook
+    if emoji == "brain":
+        try:
+            history = await client.conversations_history(
+                channel=channel, latest=msg_ts, limit=1, inclusive=True
+            )
+            msgs = history.get("messages") or []
+            if msgs:
+                text = msgs[0].get("text", "").strip()
+                if text:
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(
+                            BRAIN_WEBHOOK_URL,
+                            json={"text": text, "channel": channel, "ts": msg_ts}
+                        )
+                    logger.info("Sent message to Company Brain n8n webhook")
+        except Exception as e:
+            logger.warning("Brain webhook failed: %s", e, exc_info=True)
+        return
+
+    # Plane status changes
     target_group = EMOJI_TO_STATE_GROUP.get(emoji)
     if not target_group:
         return
