@@ -261,12 +261,13 @@ slack_app.command("/cs")(ack=slash_ack, lazy=[slash_lazy])
 async def handle_recap_request(client, *, channel: str, days: int, reply_ts: str) -> None:
     import time
     import openai
-    oldest = str(time.time() - days * 24 * 60 * 60)
     try:
-        result = await client.conversations_history(channel=channel, oldest=oldest, limit=500)
+        oldest = str(time.time() - days * 24 * 60 * 60)
+        result = await client.conversations_history(channel=channel, oldest=oldest, limit=200)
         msgs = result.get("messages") or []
+        logger.info("Recap: channel=%s days=%d fetched=%d", channel, days, len(msgs))
         lines = []
-        for m in reversed(msgs):
+        for m in msgs:
             if m.get("bot_id") or m.get("subtype"):
                 continue
             msg_text = (m.get("text") or "").strip()
