@@ -267,8 +267,7 @@ async def handle_show_brain(client, *, channel: str, reply_ts: str) -> None:
         results = index.query(
             vector=[0.0] * 1536,
             top_k=10,
-            include_metadata=True,
-            filter={"channel": {"$eq": channel}}
+            include_metadata=True
         )
         matches = results.get("matches") or []
         if not matches:
