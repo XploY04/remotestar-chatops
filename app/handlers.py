@@ -258,6 +258,47 @@ slack_app.command("/cs")(ack=slash_ack, lazy=[slash_lazy])
 
 
 
+async def handle_show_brain(client, *, channel: str, reply_ts: str) -> None:
+    try:
+        from pinecone import Pinecone
+        import os
+        pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
+        index = pc.Index(os.environ.get("PINECONE_INDEX", "remotestar-brain"))
+        results = index.query(
+            vector=[0.0] * 1536,
+            top_k=10,
+            include_metadata=True,
+            filter={"channel": {"$eq": channel}}
+        )
+        matches = results.get("matches") or []
+        if not matches:
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=reply_ts,
+                text="No entries found in Company Brain for this channel. React with brain emoji to save!"
+            )
+            return
+        lines = []
+        for i, m in enumerate(matches, 1):
+            meta = m.get("metadata") or {}
+            txt = meta.get("text", "")
+            if txt:
+                lines.append(str(i) + ". " + txt[:400])
+        summary = "\n\n".join(lines)
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=reply_ts,
+            text=":brain: *Company Brain:*\n\n" + summary
+        )
+    except Exception as e:
+        logger.warning("Show brain failed: %s", e, exc_info=True)
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=reply_ts,
+            text="Sorry, couldn't fetch from Company Brain: " + str(e)
+        )
+
+
 async def handle_recap_request(client, *, channel: str, days: int, reply_ts: str) -> None:
     import time
     import openai
@@ -323,6 +364,11 @@ async def mention_lazy(event, client):
     if not text and not files:
         await client.chat_postMessage(channel=channel, thread_ts=reply_ts,
             text="Mention me with an instruction. Try `@chatops help`.")
+        return
+
+    # Show brain intent
+    if any(kw in text.lower() for kw in ["show brain", "what's in the brain", "whats in the brain", "brain contents", "show me the brain"]):
+        await handle_show_brain(client, channel=channel, reply_ts=reply_ts)
         return
 
     # Recap intent — ask user for time range
