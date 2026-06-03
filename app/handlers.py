@@ -336,7 +336,7 @@ async def mention_lazy(event, client):
 
     # User replied with a number of days for recap
     days_match = re.search(r"\b(7|10|20)\b", text)
-    if days_match and event.get("thread_ts"):
+    if days_match:
         days = int(days_match.group(1))
         await handle_recap_request(client, channel=channel, days=days, reply_ts=reply_ts)
         return
