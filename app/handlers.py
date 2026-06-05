@@ -298,6 +298,49 @@ async def handle_show_brain(client, *, channel: str, reply_ts: str) -> None:
         )
 
 
+async def handle_personalized_message(client, *, channel: str, text: str, reply_ts: str) -> None:
+    import openai
+    try:
+        prompt = (
+            "You are an expert BD copywriter for RemoteStar, an AI-powered recruiting company.\n"
+            "Based on the context provided, write a hyperpersonalized outreach message.\n\n"
+            "Rules:\n"
+            "- Use the person's first name\n"
+            "- Reference their company and role\n"
+            "- Mention the specific signal or context (funding, job posting, etc.)\n"
+            "- Connect their pain point to RemoteStar's solution\n"
+            "- End with a clear, soft CTA (call/demo/reply)\n"
+            "- Keep it under 100 words\n"
+            "- Sound human, not salesy\n"
+            "- If LinkedIn message: conversational and short\n"
+            "- If email: slightly longer with subject line\n\n"
+            "RemoteStar's value prop: We help companies hire faster using AI screening + "
+            "CTO-led expertise. We deliver interview-ready candidates, not 500 resumes.\n\n"
+            "Context provided by user:\n"
+            + text
+        )
+        oai = openai.AsyncOpenAI()
+        response = await oai.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.7,
+        )
+        result = response.choices[0].message.content
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=reply_ts,
+            text=":pencil: *Hyperpersonalized message:*\n\n" + result
+        )
+    except Exception as e:
+        logger.warning("Personalized message failed: %s", e, exc_info=True)
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=reply_ts,
+            text="Sorry, couldn't generate the message: " + str(e)
+        )
+
+
 async def handle_recap_request(client, *, channel: str, days: int, reply_ts: str) -> None:
     import time
     import openai
@@ -363,6 +406,12 @@ async def mention_lazy(event, client):
     if not text and not files:
         await client.chat_postMessage(channel=channel, thread_ts=reply_ts,
             text="Mention me with an instruction. Try `@chatops help`.")
+        return
+
+    # Hyperpersonalized message intent
+    msg_keywords = ["write linkedin", "write email", "draft message", "write a message", "outreach to", "write outreach", "draft linkedin", "draft email", "write a linkedin", "write a email"]
+    if any(kw in text.lower() for kw in msg_keywords):
+        await handle_personalized_message(client, channel=channel, text=text, reply_ts=reply_ts)
         return
 
     # Show brain intent
