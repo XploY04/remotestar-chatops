@@ -384,6 +384,35 @@ async def handle_recap_request(client, *, channel: str, days: int, reply_ts: str
             text="Sorry, failed to generate recap: " + str(e))
 
 
+async def handle_inbox_digest(client, *, channel: str, since_minutes: int, reply_ts: str) -> None:
+    import openai
+    from app.gmail_digest import fetch_recent_emails
+    try:
+        data = json.loads(await fetch_recent_emails(since_minutes=since_minutes))
+        emails = data.get("emails") or []
+        if not emails:
+            await client.chat_postMessage(channel=channel, thread_ts=reply_ts,
+                text=f"Inbox quiet — nothing in the last {since_minutes} min.")
+            return
+        prompt = (
+            "Summarize these shared-inbox emails for Slack. For each, newest first: "
+            "one line with the sender's name in **bold**, then 3-5 '- ' bullets of the "
+            "content and any ask. No preamble.\n\n" + json.dumps(emails, ensure_ascii=False)
+        )
+        oai = openai.AsyncOpenAI()
+        resp = await oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1200,
+        )
+        await client.chat_postMessage(channel=channel, thread_ts=reply_ts,
+            text=to_slack_mrkdwn(resp.choices[0].message.content))
+    except Exception as e:
+        logger.warning("Inbox digest failed: %s", e, exc_info=True)
+        await client.chat_postMessage(channel=channel, thread_ts=reply_ts,
+            text="Couldn't summarize the inbox: " + str(e))
+
+
 async def mention_ack(ack):
     await ack()
 
@@ -417,6 +446,11 @@ async def mention_lazy(event, client):
     # Show brain intent
     if any(kw in text.lower() for kw in ["show brain", "what's in the brain", "whats in the brain", "brain contents", "show me the brain"]):
         await handle_show_brain(client, channel=channel, reply_ts=reply_ts)
+        return
+
+    # Inbox digest intent (before recap — "summarize the inbox" also matches recap keywords)
+    if "inbox" in text.lower():
+        await handle_inbox_digest(client, channel=channel, since_minutes=60, reply_ts=reply_ts)
         return
 
     # Recap intent — ask user for time range
